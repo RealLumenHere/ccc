@@ -25,6 +25,17 @@
   .status { color: var(--dim); }
   .status.limit { color: var(--warn); }
   .status.resume { color: #59c059; }
+  /* wq#4561: tile tally + fleet dots */
+  .tiles .k { color: var(--dim); margin-left: 4px; }
+  .tiles .k b { color: var(--text); }
+  .tiles .k.working b { color: var(--warn); }
+  .tiles .k.limited b { color: #f97316; }
+  .tiles .k.error b { color: var(--hot); }
+  #fleet { display: flex; align-items: center; gap: 3px; }
+  #fleet .nd { width: 7px; height: 7px; border-radius: 50%; background: #59c059; }
+  #fleet .nd.off { background: #e85e8c; }
+  #fleet .nd.na { background: var(--track); }
+  .note { color: var(--dim); max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>
 
 <div class="bar">
@@ -43,6 +54,8 @@
     <span class="track"><span class="fill" id="f-fable"></span></span>
     <span class="val" id="v-fable">—</span>
   </div>
+  <div class="metric tiles" id="tiles"><span class="lbl">Tiles</span><span class="k"><b id="t-total">–</b></span></div>
+  <div class="note" id="note"></div>
   <div class="spacer"></div>
   <div class="metric sys"><span class="lbl">CPU</span><span class="track"><span class="fill" id="f-cpu"></span></span><span class="val" id="s-cpu">—</span></div>
   <div class="metric sys"><span class="lbl">Temp</span><span class="val" id="s-temp">—</span></div>
@@ -55,6 +68,7 @@
   <div class="metric ds"><span class="lbl">mo</span><span class="val" id="ds-month">—</span></div>
   <div class="metric ds"><span class="lbl">yr</span><span class="val" id="ds-year">—</span></div>
   <div class="metric ds"><span class="lbl">last</span><span class="val" id="ds-last">—</span></div>
+  <div class="metric"><span class="lbl">Fleet</span><span id="fleet" title="Lumen messenger /nodes"></span><span class="val" id="fl-aq" title="open alerts (aq)"></span></div>
   <div class="status" id="status"></div>
 </div>
 
@@ -104,6 +118,34 @@
       if (d.temp == null) { t.textContent = '—'; t.style.color = ''; }
       else { t.textContent = d.temp + '°C'; t.style.color = d.temp >= 85 ? '#e85e8c' : d.temp >= 70 ? '#eeb32b' : '#e4e4e7'; }
     }
+  });
+  // wq#4561: per-tile status tally + one-line notes (capture/broadcast)
+  let noteTimer = null;
+  window.ccc.on('tileStatus', (d) => {
+    if (!d) return;
+    if (d.counts) {
+      const c = d.counts, order = ['working', 'continue', 'limited', 'error'];
+      let html = '<b id="t-total">' + (d.total || 0) + '</b>';
+      for (const k of order) if (c[k]) html += '</span><span class="k ' + k + '">' + k + ' <b>' + c[k] + '</b>';
+      $('#tiles').innerHTML = '<span class="lbl">Tiles</span><span class="k">' + html + '</span>';
+    }
+    if (d.note) {
+      const n = $('#note'); n.textContent = d.note;
+      clearTimeout(noteTimer); noteTimer = setTimeout(() => { n.textContent = ''; }, 12000);
+    }
+  });
+  // wq#4561: fleet dots from Lumen /nodes + aq open count
+  window.ccc.on('fleet', (d) => {
+    const box = $('#fleet'); if (!box || !d) return;
+    box.innerHTML = '';
+    if (!d.ok) { const s = document.createElement('span'); s.className = 'nd na'; s.title = 'Lumen unreachable'; box.appendChild(s); }
+    (d.nodes || []).forEach((n) => {
+      const s = document.createElement('span');
+      s.className = 'nd' + (n.online ? '' : ' off');
+      s.title = n.name + (n.online ? ' · ' + (n.latency != null ? Math.round(n.latency * 1000) / 1000 + 's' : 'up') + (n.cpu ? ' · cpu ' + n.cpu + '%' : '') : ' · OFFLINE');
+      box.appendChild(s);
+    });
+    $('#fl-aq').textContent = d.aqOpen != null ? 'aq ' + d.aqOpen : '';
   });
   window.ccc.on('resumed', () => {
     const s = $('#status'); s.className = 'status resume'; s.textContent = 'Resumed';

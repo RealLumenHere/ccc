@@ -4,7 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const {
   app, BaseWindow, WebContentsView, session,
-  ipcMain, globalShortcut, Menu, nativeTheme, shell
+  ipcMain, globalShortcut, Menu, nativeTheme, shell, clipboard
 } = require('electron');
 
 // Google blocks OAuth in embedded webviews when UA advertises Electron
@@ -84,6 +84,14 @@ let handles = [];            // resize-handle WebContentsViews, one per gap: han
 // Global chat-tile zoom (2026-09-25) ------------------------------------------
 let zoomFactor = CFG.ZOOM_DEFAULT;   // applies to every tile's webContents at once, never the chrome bars
 
+// Solo a tile (2026-10-23, wq#4561): when set, only this tab is laid out, at
+// full row width; the rest stay loaded but hidden. Toggle = double-click a
+// chip or Ctrl+Shift+F. Clears itself if that tab closes.
+let soloId = null;
+// Topbar height is dynamic: the broadcast box asks for more room while it is
+// open (ccc:topbarHeight) and hands it back on close.
+let topbarH = CFG.TOPBAR_HEIGHT;
+
 const DBG = (...a) => { if (process.env.CCC_DEBUG) console.log('[ccc]', ...a); };
 
 // ---------------------------------------------------------------------------
@@ -145,7 +153,8 @@ function widthsForVisible(visibleTabs, avail) {
 // and the visible-tab list so callers (relayout, syncHandles, live drag)
 // share one source of truth instead of recomputing the partition twice.
 function layoutRow(W, top, midH, columns, gap) {
-  const visible = tabs.slice(pageOffset, pageOffset + columns);
+  const solo = soloTab();
+  const visible = solo ? [solo] : tabs.slice(pageOffset, pageOffset + columns);
   const avail = Math.max(0, W - gap * (columns - 1));
   const widths = widthsForVisible(visible, avail);
   const xs = [];
@@ -210,14 +219,14 @@ function syncHandles(columns, top, midH, gap, xs, widths) {
 function relayout() {
   if (!win) return;
   const [W, H] = win.getContentSize();
-  const top = CFG.TOPBAR_HEIGHT;
+  const top = topbarH;
   const bot = CFG.BOTTOMBAR_HEIGHT;
   const midH = Math.max(0, H - top - bot);
 
   topbar.setBounds({ x: 0, y: 0, width: W, height: top });
   bottombar.setBounds({ x: 0, y: H - bot, width: W, height: bot });
 
-  const columns = computeColumns(W);
+  const columns = soloTab() ? 1 : computeColumns(W);
   const maxOffset = Math.max(0, tabs.length - columns);
   if (pageOffset > maxOffset) pageOffset = maxOffset;
   if (pageOffset < 0) pageOffset = 0;
@@ -245,7 +254,7 @@ function applyDrag(screenX) {
   tabB.widthFrac = newWB / avail;
 
   const [W, H] = win.getContentSize();
-  const top = CFG.TOPBAR_HEIGHT, bot = CFG.BOTTOMBAR_HEIGHT;
+  const top = topbarH, bot = CFG.BOTTOMBAR_HEIGHT;
   const midH = Math.max(0, H - top - bot);
   const { widths, xs } = layoutRow(W, top, midH, columns, gap);
   for (let i = 0; i < handles.length; i++) {
@@ -257,8 +266,9 @@ function applyDrag(screenX) {
 function pushTabStrip(columns, maxOffset) {
   if (!topbar) return;
   topbar.webContents.send('tabs', {
-    tabs: tabs.map((t) => ({ id: t.id, title: t.title || 'New chat', color: t.color || null })),
+    tabs: tabs.map((t) => ({ id: t.id, title: t.title || 'New chat', color: t.color || null, status: t.status || 'idle' })),
     activeId,
+    soloId,
     pageOffset,
     columns,
     maxOffset
@@ -503,6 +513,7 @@ function closeTab(id) {
   const idx = tabs.findIndex((t) => t.id === id);
   if (idx === -1) return;
   const [tab] = tabs.splice(idx, 1);
+  if (soloId === id) soloId = null;
   try { win.contentView.removeChildView(tab.view); } catch (_e) {}
   // BaseWindow won't destroy webContents for us -> we must, or it leaks.
   try { tab.view.webContents.close(); } catch (_e) {}
@@ -586,6 +597,26 @@ function cleanTitle(t) {
 // this pushes an explicit ccc:setActive down whenever activeId changes.
 // Safe to call with a stale/removed id (e.g. a tab that just closed) — the
 // find() just misses and nothing is sent.
+function soloTab() {
+  if (soloId == null) return null;
+  const t = tabs.find((x) => x.id === soloId);
+  if (!t) soloId = null;
+  return t || null;
+}
+function toggleSolo(id) {
+  if (id == null) return;
+  soloId = (soloId === id) ? null : id;
+  if (soloId != null) activate(soloId, {});
+  relayout();
+}
+function fmtK(n) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n || 0); }
+function pushStatusSummary() {
+  if (!bottombar) return;
+  const counts = {};
+  for (const t of tabs) { const s = t.status || 'idle'; counts[s] = (counts[s] || 0) + 1; }
+  try { bottombar.webContents.send('tileStatus', { counts, total: tabs.length }); } catch (_e) {}
+}
+
 function pushActive(id, isActive) {
   const tab = tabs.find((t) => t.id === id);
   if (tab) { try { tab.view.webContents.send('ccc:setActive', isActive); } catch (_e) {} }
@@ -696,7 +727,7 @@ function wireIpc() {
     const idx = handles.findIndex((h) => h.view.webContents.id === e.sender.id);
     if (idx === -1) return;
     const [W, H] = win.getContentSize();
-    const top = CFG.TOPBAR_HEIGHT, bot = CFG.BOTTOMBAR_HEIGHT;
+    const top = topbarH, bot = CFG.BOTTOMBAR_HEIGHT;
     const midH = Math.max(0, H - top - bot);
     const columns = computeColumns(W);
     const gap = CFG.TILE_GAP || 0;
@@ -770,6 +801,74 @@ function wireIpc() {
   });
   ipcMain.on('ccc:resumed', () => {
     if (bottombar) bottombar.webContents.send('resumed', {});
+  });
+
+  // ---- orchestration (2026-10-23, wq#4561) -------------------------------
+  // per-tile status from the page heartbeat -> chip dot + bottom-bar tally
+  ipcMain.on('ccc:status', (e, p) => {
+    const tab = tabs.find((t) => t.view.webContents.id === e.sender.id);
+    if (!tab || !p || !p.state) return;
+    tab.status = p.state; tab.statusSince = p.at || Date.now();
+    const [W] = win.getContentSize();
+    const columns = soloTab() ? 1 : computeColumns(W);
+    pushTabStrip(columns, Math.max(0, tabs.length - columns));
+    pushStatusSummary();
+  });
+  // last assistant reply, after every completion -> kept on the tab + jsonl
+  ipcMain.on('ccc:captured', (e, p) => {
+    const tab = tabs.find((t) => t.view.webContents.id === e.sender.id);
+    if (!tab || !p || !p.text) return;
+    tab.lastOutput = p.text; tab.lastOutputAt = p.at || Date.now();
+    if (CFG.CAPTURE_ENABLED !== false) {
+      try {
+        const dir = path.join(app.getPath('userData'), 'captures');
+        fs.mkdirSync(dir, { recursive: true });
+        fs.appendFileSync(path.join(dir, `tab-${tab.id}.jsonl`),
+          JSON.stringify({ t: p.at || Date.now(), title: tab.title, url: p.url || '', chars: p.chars, text: p.text }) + '\n');
+      } catch (_e) {}
+    }
+    if (bottombar) bottombar.webContents.send('tileStatus', { note: `\u201c${tab.title}\u201d done \u00b7 ${fmtK(p.chars)} chars` });
+  });
+  ipcMain.on('ccc:injected', (e, p) => {
+    const tab = tabs.find((t) => t.view.webContents.id === e.sender.id);
+    if (!tab || !p) return;
+    DBG('injected', tab.id, p);
+    if (p.ok === false && bottombar) {
+      bottombar.webContents.send('tileStatus', { note: `\u201c${tab.title}\u201d: not sent (${p.reason || 'composer'})` });
+    }
+  });
+  // one prompt -> N tiles, staggered; busy (working/limited) tiles are skipped
+  ipcMain.on('ccc:broadcast', (_e, p) => {
+    if (!p || !p.text || !Array.isArray(p.ids)) return;
+    const targets = p.ids.map((id) => tabs.find((t) => t.id === id)).filter(Boolean);
+    const stagger = CFG.BROADCAST_STAGGER_MS || 2000;
+    let i = 0; const sent = [], skipped = [];
+    targets.forEach((tab) => {
+      const st = tab.status || 'idle';
+      if (st === 'working' || st === 'limited') { skipped.push(tab.title); return; }
+      const delay = (i++) * stagger;
+      setTimeout(() => {
+        if (!tabs.includes(tab) || tab.view.webContents.isDestroyed()) return;
+        try { tab.view.webContents.send('ccc:inject', { text: p.text, send: p.send !== false, force: !!p.force, reqId: 'b' + Date.now() }); } catch (_e) {}
+      }, delay);
+      sent.push(tab.title);
+    });
+    if (bottombar) bottombar.webContents.send('tileStatus', {
+      note: `broadcast \u2192 ${sent.length} tile(s)` + (skipped.length ? ` \u00b7 skipped ${skipped.length} busy` : '')
+    });
+  });
+  ipcMain.on('ccc:toggleSolo', (_e, id) => toggleSolo(id == null ? activeId : id));
+  ipcMain.on('ccc:copyLast', (_e, id) => {
+    const tab = tabs.find((t) => t.id === (id == null ? activeId : id));
+    if (!tab) return;
+    if (tab.lastOutput) { try { clipboard.writeText(tab.lastOutput); } catch (_e) {} }
+    else { try { tab.view.webContents.send('ccc:capture'); } catch (_e) {} }   // ask the page, next copy will have it
+    if (bottombar) bottombar.webContents.send('tileStatus', { note: tab.lastOutput ? `copied \u201c${tab.title}\u201d (${fmtK(tab.lastOutput.length)} chars)` : 'nothing captured yet for that tile' });
+  });
+  ipcMain.on('ccc:topbarHeight', (_e, h) => {
+    const want = (typeof h === 'number' && h > CFG.TOPBAR_HEIGHT) ? Math.min(h, 400) : CFG.TOPBAR_HEIGHT;
+    if (want === topbarH) return;
+    topbarH = want; relayout();
   });
 
   // completion signal -> optional ntfy ping
@@ -931,6 +1030,25 @@ function startSysStatsTelemetry() {
   ssTimer = setInterval(pollSysStats, CFG.SYSSTATS_POLL_MS || 3000);
 }
 
+// Fleet telemetry (2026-10-23, wq#4561): Lumen messenger /nodes (online,
+// latency, cpu, ram per fleet node) + /aq (open alert count). Same server and
+// transport as the DeepSeek poller; tailnet-direct, no CORS, no auth.
+let fleetTimer = null;
+async function pollFleet() {
+  if (!CFG.NODES_URL) return;
+  const n = await fetchSpendJSON(CFG.NODES_URL);
+  const a = CFG.AQ_URL ? await fetchSpendJSON(CFG.AQ_URL) : null;
+  if (!bottombar) return;
+  const nodes = (n && Array.isArray(n.nodes))
+    ? n.nodes.map((x) => ({ id: x.id, name: x.name, online: !!x.online, latency: x.latency, cpu: x.cpu_percent, ram: x.ram_percent }))
+    : null;
+  bottombar.webContents.send('fleet', { ok: !!nodes, nodes: nodes || [], aqOpen: (a && typeof a.open === 'number') ? a.open : null });
+}
+function startFleetTelemetry() {
+  pollFleet();
+  fleetTimer = setInterval(pollFleet, CFG.NODES_POLL_MS || 60000);
+}
+
 // ---------------------------------------------------------------------------
 // Chrome views (our own top/bottom bars)
 // ---------------------------------------------------------------------------
@@ -1013,6 +1131,7 @@ function boot() {
   registerShortcuts();
   startDeepseekTelemetry();
   startSysStatsTelemetry();
+  startFleetTelemetry();
 }
 
 // App shortcuts, scoped to CCC's own webContents via before-input-event.
@@ -1047,6 +1166,7 @@ function handleAppKeys(e, input) {
   } else {
     // move the active chat left / right in the manual order
     if (k === 'pageup') { e.preventDefault(); moveActive(-1); return true; }
+    if (k === 'f') { e.preventDefault(); toggleSolo(activeId); return true; }   // solo the active tile (wq#4561)
     if (k === 'pagedown') { e.preventDefault(); moveActive(+1); return true; }
   }
   return false;
@@ -1078,5 +1198,5 @@ function setZoom(factor) {
 
 app.whenReady().then(boot);
 app.on('before-quit', () => { store.saveNow(snapshot); });  // covers SIGTERM / non-window quit paths
-app.on('will-quit', () => { globalShortcut.unregisterAll(); if (dsTimer) clearInterval(dsTimer); });
+app.on('will-quit', () => { globalShortcut.unregisterAll(); if (dsTimer) clearInterval(dsTimer); if (fleetTimer) clearInterval(fleetTimer); });
 app.on('window-all-closed', () => app.quit());

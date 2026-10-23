@@ -78,9 +78,27 @@ BaseWindow
 Selectors in `styles.css` / `automations.js` are attribute/text based and fail
 soft — a claude.ai markup change no-ops a rule, it never breaks the page.
 
-## Not wired yet (easy adds, say the word)
+## Orchestration (2026-10-23)
 
-- Broadcast-prompt (type once → send to selected tiles) for parallel agent runs.
-- Double-click a tile to solo/zoom it full-shell.
-- Per-tile working/idle dot.
-- Saved layout presets.
+- **Per-tile status dot** on each chip: green idle · amber pulsing working ·
+  cyan pulsing tool-limit pause · orange rate-limited · pink error. Hover the
+  chip for the word. Bottom bar tallies them (`Tiles 20 · working 3`).
+- **Broadcast prompt**: `Ctrl+click` chips to select, `⇶ broadcast` opens a
+  box, `send to selected` injects + sends to each selected tile with a
+  `BROADCAST_STAGGER_MS` gap (busy tiles are skipped, never interrupted).
+  `stage only` fills the composers without sending. A tile with a human draft
+  in its composer is never overwritten. Injection targets claude.ai's
+  ProseMirror composer properly (TipTap API → `execCommand('insertText')` →
+  synthetic paste), not `textContent`.
+- **Output capture**: after every completion the last assistant reply is kept
+  on the tab and appended to `userData/captures/tab-<id>.jsonl`. Right-click a
+  chip to copy that tile's last reply to the clipboard.
+- **Solo a tile**: double-click a chip (or `Ctrl+Shift+F`) to give it the full
+  row; again to restore. Nothing reloads.
+- **Fleet dots** in the bottom bar: one dot per fleet node from Lumen's
+  messenger `/nodes` (green up / pink down), plus the open `aq` count.
+
+## Not wired yet
+
+- Saved layout presets (wants the hibernation governor first — see
+  `scratch/research/ccc-improvements.md` on Lumen).

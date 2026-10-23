@@ -17,8 +17,23 @@ window.addEventListener('message', (ev) => {
     case 'limit':            ipcRenderer.send('ccc:limit', m.data); break;
     case 'resumed':          ipcRenderer.send('ccc:resumed', m.data); break;
     case 'setColor':         ipcRenderer.send('ccc:setColor', m.data); break;
+    case 'status':           ipcRenderer.send('ccc:status', m.data); break;      // wq#4561
+    case 'captured':         ipcRenderer.send('ccc:captured', m.data); break;    // wq#4561
+    case 'injected':         ipcRenderer.send('ccc:injected', m.data); break;    // wq#4561
     default: break;
   }
+});
+
+// Shell -> page commands (wq#4561): relayed into the main world as __ccc_cmd
+// messages; automations.js owns the DOM side. Fail soft either way.
+ipcRenderer.on('ccc:inject', (_e, p) => {
+  try {
+    window.postMessage({ __ccc_cmd: true, type: 'inject', text: p && p.text, send: !!(p && p.send),
+      force: !!(p && p.force), reqId: p && p.reqId }, '*');
+  } catch (_err) {}
+});
+ipcRenderer.on('ccc:capture', () => {
+  try { window.postMessage({ __ccc_cmd: true, type: 'capture' }, '*'); } catch (_err) {}
 });
 
 ipcRenderer.on('ccc:setSidebar', (_e, expanded) => {

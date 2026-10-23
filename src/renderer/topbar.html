@@ -32,9 +32,30 @@
   .chip.dragging { opacity: 0.35; }
   .chip .x { opacity: 0.5; font-size: 11px; }
   .chip .x:hover { opacity: 1; color: #e0885a; }
+  /* Per-tile status dot (2026-10-23, wq#4561): idle / working / continue /
+     limited / error. Fed by automations.js statusTick via main.js. */
+  .chip .st { width: 7px; height: 7px; min-width: 7px; border-radius: 50%; background: #59c059; }
+  .chip .st.working { background: #eeb32b; animation: ccc-pulse 1s ease-in-out infinite; }
+  .chip .st.continue { background: #3cc2dd; animation: ccc-pulse 1s ease-in-out infinite; }
+  .chip .st.limited { background: #f97316; }
+  .chip .st.error { background: #e85e8c; }
+  @keyframes ccc-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+  /* Ctrl+click selection for broadcast; double-click = solo */
+  .chip.selected { box-shadow: inset 0 0 0 1px #3cc2dd; border-color: #3cc2dd; }
+  .chip.solo { border-style: dashed; }
   .pager { display: flex; align-items: center; gap: 4px; color: var(--dim); }
   .pager .rng { min-width: 54px; text-align: center; }
   .sp { flex: 0 0 1px; height: 16px; background: var(--border); margin: 0 2px; }
+  /* Broadcast box (wq#4561): hidden until toggled; main.js grows the topbar
+     view to make room (ccc:topbarHeight) and shrinks it back on close. */
+  #bc { display: none; padding: 4px 6px 6px; gap: 6px; flex-direction: column; }
+  #bc.open { display: flex; }
+  #bc textarea { width: 100%; height: 74px; resize: none; background: var(--surf); color: var(--text);
+    border: 1px solid var(--border); border-radius: 5px; padding: 5px 7px; font: inherit; -webkit-user-select: text; user-select: text; }
+  #bc .row { display: flex; align-items: center; gap: 6px; color: var(--dim); }
+  #bc .row .n { color: var(--text); font-weight: 700; }
+  #bc .spacer { flex: 1; }
+  #bcbtn.on { border-color: #3cc2dd; color: #3cc2dd; }
 </style>
 
 <div class="bar">
@@ -48,24 +69,79 @@
     <button class="icon" id="next" title="Scroll right (Ctrl+→)">›</button>
   </div>
   <div class="sp"></div>
+  <button id="bcbtn" title="Broadcast a prompt to the selected tiles (Ctrl+click chips to select)">⇶ broadcast</button>
   <button id="side" title="Toggle sidebar in active chat">☰ sidebar</button>
+</div>
+<div id="bc">
+  <textarea id="bctext" placeholder="Type once — goes to every selected tile (Ctrl+click chips to select). Ctrl+Enter sends."></textarea>
+  <div class="row">
+    <span><span class="n" id="bcn">0</span> selected</span>
+    <span class="spacer"></span>
+    <button id="bcall" title="Select every idle tile">select idle</button>
+    <button id="bcnone" title="Clear selection">clear</button>
+    <button id="bcstage" title="Put the text in each selected composer without sending">stage only</button>
+    <button id="bcsend" title="Inject and send to each selected tile, staggered">send to selected</button>
+    <button class="icon" id="bcclose" title="Close">×</button>
+  </div>
 </div>
 
 <script>
   const $ = (s) => document.querySelector(s);
   const COLOR_HEX = { green:'#22c55e', red:'#ef4444', black:'#a1a1aa', yellow:'#eab308', blue:'#3b82f6' }; // 'gray' removed 2026-09-26; 'black' matched to the tile accent's neutral (2026-09-26 v3) rather than true #000, which read as invisible on a dark dot
+  const STATUS_TITLE = { idle:'idle', working:'working…', continue:'tool-limit pause (auto-continue)', limited:'rate-limited', error:'error' };
+  const selected = new Set();   // tab ids chosen for broadcast (Ctrl+click)
+  let lastSt = null;
   $('#add').onclick  = () => window.ccc.send('ccc:newTab');
   $('#prev').onclick = () => window.ccc.send('ccc:page', -1);
   $('#next').onclick = () => window.ccc.send('ccc:page', +1);
   $('#side').onclick = () => window.ccc.send('ccc:toggleSidebar');
 
-  window.ccc.on('tabs', (st) => {
+  // ---- broadcast box (wq#4561) ----
+  const BC_H = 150;   // keep in sync with CFG.BROADCAST_TOPBAR_HEIGHT
+  function bcOpen(open) {
+    $('#bc').classList.toggle('open', open);
+    $('#bcbtn').classList.toggle('on', open);
+    window.ccc.send('ccc:topbarHeight', open ? BC_H : 0);
+    if (open) setTimeout(() => $('#bctext').focus(), 50);
+  }
+  function bcCount() { $('#bcn').textContent = String(selected.size); }
+  function bcFire(send) {
+    const text = $('#bctext').value.trim();
+    if (!text || !selected.size) return;
+    window.ccc.send('ccc:broadcast', { text, ids: [...selected], send });
+    if (send) $('#bctext').value = '';
+  }
+  $('#bcbtn').onclick = () => bcOpen(!$('#bc').classList.contains('open'));
+  $('#bcclose').onclick = () => bcOpen(false);
+  $('#bcsend').onclick = () => bcFire(true);
+  $('#bcstage').onclick = () => bcFire(false);
+  $('#bcnone').onclick = () => { selected.clear(); bcCount(); if (lastSt) render(lastSt); };
+  $('#bcall').onclick = () => {
+    if (!lastSt) return;
+    selected.clear();
+    lastSt.tabs.forEach((t) => { if ((t.status || 'idle') === 'idle') selected.add(t.id); });
+    bcCount(); render(lastSt);
+  };
+  $('#bctext').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); bcFire(true); }
+    if (e.key === 'Escape') { e.preventDefault(); bcOpen(false); }
+  });
+
+  function render(st) {
     const box = $('#tabs');
     box.innerHTML = '';
+    // drop selections for tabs that no longer exist
+    for (const id of [...selected]) { if (!st.tabs.some((t) => t.id === id)) selected.delete(id); }
+    bcCount();
     st.tabs.forEach((t, i) => {
-      const onscreen = i >= st.pageOffset && i < st.pageOffset + st.columns;
+      const onscreen = st.soloId != null ? (t.id === st.soloId) : (i >= st.pageOffset && i < st.pageOffset + st.columns);
       const chip = document.createElement('div');
-      chip.className = 'chip' + (t.id === st.activeId ? ' active' : '') + (onscreen ? '' : ' offscreen');
+      chip.className = 'chip' + (t.id === st.activeId ? ' active' : '') + (onscreen ? '' : ' offscreen')
+        + (selected.has(t.id) ? ' selected' : '') + (t.id === st.soloId ? ' solo' : '');
+      chip.title = (STATUS_TITLE[t.status] || t.status || 'idle') + ' — Ctrl+click: select for broadcast · double-click: solo · right-click: copy last reply';
+      const sdot = document.createElement('span');
+      sdot.className = 'st ' + (t.status || 'idle');
+      chip.appendChild(sdot);
       if (t.color && COLOR_HEX[t.color]) {
         const dot = document.createElement('span');
         dot.className = 'dot'; dot.style.background = COLOR_HEX[t.color];
@@ -76,7 +152,15 @@
       const x = document.createElement('span');
       x.className = 'x'; x.textContent = '×';
       x.onclick = (e) => { e.stopPropagation(); window.ccc.send('ccc:closeTab', t.id); };
-      chip.onclick = () => window.ccc.send('ccc:focusTab', t.id);
+      chip.onclick = (e) => {
+        if (e.ctrlKey || e.metaKey) {            // toggle selection for broadcast
+          if (selected.has(t.id)) selected.delete(t.id); else selected.add(t.id);
+          bcCount(); render(st); return;
+        }
+        window.ccc.send('ccc:focusTab', t.id);
+      };
+      chip.ondblclick = (e) => { e.preventDefault(); window.ccc.send('ccc:toggleSolo', t.id); };
+      chip.oncontextmenu = (e) => { e.preventDefault(); window.ccc.send('ccc:copyLast', t.id); };
       chip.draggable = true;
       chip.ondragstart = (e) => { e.dataTransfer.setData('text/plain', String(t.id)); e.dataTransfer.effectAllowed = 'move'; chip.classList.add('dragging'); };
       chip.ondragend = () => chip.classList.remove('dragging');
@@ -102,8 +186,9 @@
     };
     const first = st.pageOffset + 1;
     const last = Math.min(st.pageOffset + st.columns, st.tabs.length);
-    $('#rng').textContent = st.tabs.length ? `${first}–${last}/${st.tabs.length}` : '–';
-    $('#prev').disabled = st.pageOffset <= 0;
-    $('#next').disabled = st.pageOffset >= st.maxOffset;
-  });
+    $('#rng').textContent = st.soloId != null ? 'solo' : (st.tabs.length ? `${first}–${last}/${st.tabs.length}` : '–');
+    $('#prev').disabled = st.soloId != null || st.pageOffset <= 0;
+    $('#next').disabled = st.soloId != null || st.pageOffset >= st.maxOffset;
+  }
+  window.ccc.on('tabs', (st) => { lastSt = st; render(st); });
 </script>

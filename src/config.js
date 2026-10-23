@@ -108,5 +108,16 @@ module.exports = {
   // Restore -----------------------------------------------------------------
   // Gap between loading each tile when restoring a saved session, so N tiles
   // don't stampede claude.ai + Cloudflare at once. Visible tiles load first.
-  RESTORE_LOAD_STAGGER_MS: 2500
+  RESTORE_LOAD_STAGGER_MS: 2500,
+
+  // Orchestration (2026-10-23, wq#4561) -----------------------------------
+  BROADCAST_STAGGER_MS: 2000,     // gap between tiles when one prompt goes to many
+  BROADCAST_TOPBAR_HEIGHT: 150,   // topbar grows to this while the broadcast box is open
+  CAPTURE_ENABLED: true,          // save each tile's last reply to userData/captures/tab-<id>.jsonl
+  CAPTURE_MAX_CHARS: 200000,
+  // Fleet telemetry: Lumen messenger /nodes + /aq (tailnet-allowlisted,
+  // same server as SPEND_URL). Empty NODES_URL = off.
+  NODES_URL: 'http://100.117.66.102:8765/nodes',
+  AQ_URL: 'http://100.117.66.102:8765/aq',
+  NODES_POLL_MS: 60000
 };

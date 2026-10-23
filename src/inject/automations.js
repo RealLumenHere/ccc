@@ -109,17 +109,59 @@
     }
     return document.querySelector('div[contenteditable="true"], textarea[data-testid], textarea');
   }
+  // Composer injection (2026-10-23, wq#4561). claude.ai's composer is a
+  // TipTap/ProseMirror contenteditable: writing textContent desyncs PM's
+  // document model from the DOM (Send stays disabled, or the text vanishes on
+  // the next transaction). Three tiers; the first that verifiably lands wins:
+  //   1. TipTap instance hung on the node (el.editor) -> insertContent
+  //   2. document.execCommand('insertText') -> PM handles it via beforeinput
+  //   3. synthetic paste carrying a DataTransfer -> PM's paste handler
+  // A plain <textarea> (markup drift) keeps the value + input-event path.
+  function composerText(el) { return el ? (el.value != null ? el.value : (el.textContent || '')) : ''; }
+  function norm(s) { return String(s || '').replace(/\s+/g, ''); }
+  function clearComposer(el) {
+    try {
+      if (el.tagName === 'TEXTAREA') { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); return; }
+      if (el.editor && el.editor.commands && el.editor.commands.clearContent) { el.editor.commands.clearContent(); return; }
+      el.focus();
+      document.execCommand('selectAll', false, null);
+      document.execCommand('delete', false, null);
+    } catch (e) {}
+  }
   function setComposer(text) {
     var el = composer(); if (!el) return false;
+    text = String(text == null ? '' : text);
+    var want = norm(text);
     if (el.tagName === 'TEXTAREA') {
       el.value = text;
       el.dispatchEvent(new Event('input', { bubbles: true }));
-    } else {
-      el.focus();
-      el.textContent = text;
-      el.dispatchEvent(new InputEvent('input', { bubbles: true }));
+      return norm(el.value) === want;
     }
-    return true;
+    clearComposer(el);
+    try {   // tier 1: TipTap API
+      if (el.editor && el.editor.commands && el.editor.commands.insertContent) {
+        try { el.editor.commands.focus(); } catch (e) {}
+        el.editor.commands.insertContent(text);
+        if (norm(composerText(el)) === want) return true;
+        clearComposer(el);
+      }
+    } catch (e) {}
+    try {   // tier 2: execCommand
+      el.focus();
+      document.execCommand('insertText', false, text);
+      if (norm(composerText(el)) === want) return true;
+      clearComposer(el);
+    } catch (e) {}
+    try {   // tier 3: synthetic paste
+      el.focus();
+      var dt = new DataTransfer();
+      dt.setData('text/plain', text);
+      el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+      if (norm(composerText(el)) === want) return true;
+    } catch (e) {}
+    // last resort = the old path, so a human at least sees the text
+    try { el.focus(); el.textContent = text; el.dispatchEvent(new InputEvent('input', { bubbles: true })); } catch (e) {}
+    return norm(composerText(el)) === want;
   }
   function clickSend() {
     var b = document.querySelector('button[aria-label*="Send" i], button[data-testid*="send" i]');
@@ -409,10 +451,85 @@
   function completionTick() {
     try {
       var s = isStreaming();
-      if (wasStreaming && !s) { post('completed', {}); scrapeSidebarUsage(); }
+      if (wasStreaming && !s) {
+        post('completed', {}); scrapeSidebarUsage();
+        if (CFG.capture !== false) setTimeout(captureLast, 400);   // let the last chunk paint
+      }
       wasStreaming = s;
     } catch (e) {}
   }
+
+  // -------------------------------------------------------------------------
+  // 4) STATUS + CAPTURE + INJECT  (2026-10-23, wq#4561)
+  //    status  : idle | working | continue | limited | error, posted on change
+  //    capture : last assistant reply, posted after every completion
+  //    inject  : shell -> composer (broadcast prompt), never over a human draft
+  // -------------------------------------------------------------------------
+  var ERROR_RE = /something went wrong|an error occurred|failed to (send|load|fetch)|please try again|network error|couldn.t connect/i;
+  function errorToastVisible() {
+    try {
+      var nodes = document.body.querySelectorAll('div[role="alert"], div[role="status"], [class*="toast" i], [data-testid*="error" i]');
+      for (var i = 0; i < nodes.length; i++) {
+        var t = nodes[i].textContent || '';
+        if (t.length < 300 && ERROR_RE.test(t) && nodes[i].offsetParent !== null) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+  var lastStatus = null;
+  function computeStatus() {
+    if (limitBannerText()) return 'limited';
+    if (isStreaming()) return 'working';
+    if (findContinueButton()) return 'continue';
+    if (errorToastVisible()) return 'error';
+    return 'idle';
+  }
+  function statusTick() {
+    try {
+      var s = computeStatus();
+      if (s !== lastStatus) { lastStatus = s; post('status', { state: s, at: Date.now() }); }
+    } catch (e) {}
+  }
+  function lastAssistantText() {
+    var sel = ['[data-testid="assistant-message"]', '[class*="font-claude-response"]', '[class*="claude-response-body"]'];
+    for (var i = 0; i < sel.length; i++) {
+      var all = document.querySelectorAll(sel[i]);
+      if (all.length) { var el = all[all.length - 1]; return (el.innerText || el.textContent || '').trim(); }
+    }
+    return '';
+  }
+  function captureLast() {
+    try {
+      var t = lastAssistantText();
+      if (!t) return;
+      post('captured', { chars: t.length, text: t.slice(0, CFG.captureMax || 200000), at: Date.now(), url: location.href });
+    } catch (e) {}
+  }
+  window.addEventListener('message', function (ev) {
+    var m = ev && ev.data;
+    if (!m || m.__ccc_cmd !== true) return;
+    try {
+      if (m.type === 'inject') {
+        var el = composer();
+        var draft = norm(composerText(el));
+        if (draft && !m.force) {   // never clobber what the human is writing
+          post('injected', { ok: false, sent: false, reason: 'draft', reqId: m.reqId || null });
+          return;
+        }
+        var ok = setComposer(m.text || '');
+        if (ok && m.send) {
+          setTimeout(function () {   // one frame for PM to enable Send
+            var sent = clickSend();
+            post('injected', { ok: true, sent: sent, chars: String(m.text || '').length, reqId: m.reqId || null });
+          }, 250);
+          return;
+        }
+        post('injected', { ok: ok, sent: false, chars: String(m.text || '').length, reqId: m.reqId || null });
+      } else if (m.type === 'capture') {
+        captureLast();
+      }
+    } catch (e) {}
+  });
 
   // -------------------------------------------------------------------------
   // Heartbeat
@@ -421,6 +538,7 @@
     autoContinueTick();
     resumeTick();
     completionTick();
+    statusTick();
   }, 1500);
   setInterval(scrapeSidebarUsage, 8000);
   scrapeSidebarUsage();
