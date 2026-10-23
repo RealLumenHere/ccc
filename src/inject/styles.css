@@ -1,55 +1,431 @@
 /* ==========================================================================
-   Injected into every claude.ai tile. Goal: kill the wasted left/right gutter
-   so narrow tiles are actually usable, and stop wide tables running off-page.
+   Injected into every claude.ai tile.
 
-   claude.ai's DOM/class names change over time. These selectors are written
-   defensively (attribute + role based where possible) and everything is
-   !important so we win the cascade. If Anthropic reshuffles the markup and a
-   rule stops biting, it just no-ops — it never breaks the page.
+   2026-08-06 v3 REWRITE. claude.ai removed the <main> wrapper (new app root
+   is div.cds-root) — every main-scoped rule in v2 had silently died, which
+   is why the gutters / tall header / tables came back. All rules are now
+   anchored to BOTH `main` (legacy, harmless) and `.cds-root` (current), so
+   whichever exists, the rule bites. Selectors below were CDP-measured
+   against the live DOM this session; everything is !important and no-ops
+   harmlessly if Anthropic reshuffles markup again.
+
+   NOTE: this file is read ONCE at app start — a page reload does NOT pick
+   up edits. Full app restart required (documented lesson, 2026-07-14).
    ========================================================================== */
 
-/* 1. Widen the conversation column. The chat is centred inside a max-width
-      container with big auto margins — that's the gutter you're seeing. */
-main div[class*="max-w-"],
+/* --------------------------------------------------------------------------
+   1. Widen the conversation column. Chat content is capped at max-w-3xl
+      (768px) and centered — at wide tiles that's the huge dead gutter.
+      The composer lives inside the same column, so it widens too.
+   -------------------------------------------------------------------------- */
 main .max-w-3xl,
-main .max-w-2xl,
-main [class*="mx-auto"] {
-  max-width: 100% !important;
-  margin-left: auto !important;
-  margin-right: auto !important;
-  padding-left: 12px !important;
-  padding-right: 12px !important;
-}
-
-/* 2. Message rows themselves — remove inner horizontal padding bloat. */
-main [data-testid*="message"],
-main [class*="prose"] {
+main div[class*="max-w-"],
+.cds-root [class*="max-w-3xl"] {
   max-width: 100% !important;
 }
+.cds-root [class*="max-w-3xl"][class*="px-4"] {
+  padding-left: 4px !important;
+  padding-right: 4px !important;
+}
+/* assistant/user rows: use the width we just reclaimed */
+.cds-root [class*="group/message-row"] {
+  max-width: 100% !important;
+  margin-right: 0 !important;
+  padding-right: 0 !important;
+}
 
-/* 3. Tables: make them scroll inside their own box instead of pushing the
-      whole layout wider than the tile. */
-main table {
+/* --------------------------------------------------------------------------
+   2. Tables scroll inside their own box; code blocks likewise.
+   -------------------------------------------------------------------------- */
+main table, .cds-root table {
   display: block !important;
   max-width: 100% !important;
   overflow-x: auto !important;
   width: max-content !important;
 }
-/* keep code blocks from doing the same thing */
-main pre {
+main pre, .cds-root pre {
   max-width: 100% !important;
   overflow-x: auto !important;
 }
 
-/* 4. Trim a little vertical chrome so more conversation is visible in a short
-      tile (we already have our own top/bottom bars in the shell). */
-main { padding-top: 4px !important; }
-
-/* 5. Sidebar: default collapsed feel. The shell toggles a body class to force
-      it open/closed per tile (see preload-view.js). */
+/* --------------------------------------------------------------------------
+   3. Sidebar collapse (shell toggles body class per tile).
+   -------------------------------------------------------------------------- */
 body.ccc-sidebar-collapsed nav[class*="sidebar"],
 body.ccc-sidebar-collapsed [data-testid*="sidebar"] {
   width: 0 !important;
   min-width: 0 !important;
   overflow: hidden !important;
+}
+
+/* --------------------------------------------------------------------------
+   4. Fonts. Anthropicons-Variable MUST stay in the stack: claude.ai renders
+      every UI icon as a PUA glyph (U+E0xx) in bare spans via that webfont;
+      dropping it = tofu boxes everywhere (2026-08-06 bug). OpenDyslexic has
+      no PUA glyphs so text resolves first. KaTeX subtree exempt.
+   -------------------------------------------------------------------------- */
+*:not(.katex):not(.katex *) {
+  font-family: 'OpenDyslexic', 'Anthropicons-Variable', 'Atkinson Hyperlegible', ui-sans-serif, system-ui, sans-serif !important;
+}
+pre, pre *, code, kbd, samp,
+[class*="mono"], [class*="font-mono"], [class*="code-"] {
+  font-family: ui-monospace, 'JetBrains Mono', 'SFMono-Regular', Menlo, Consolas, monospace !important;
+}
+main [class*="prose"] p, main [class*="prose"] li,
+.cds-root [class*="prose"] p, .cds-root [class*="prose"] li {
+  line-height: 1.75 !important;
+  letter-spacing: 0.006em !important;
+}
+
+/* --------------------------------------------------------------------------
+   5. Navy theme (claude.ai keys surfaces off --bg-000..500 tokens).
+   -------------------------------------------------------------------------- */
+/* 90's pass (2026-08-06): navy -> muted dusty plum. Deep, low-sat tones
+   picked for hour-long sessions; the 90s reads through hue, translucent
+   chrome and the chalkboard, not through brightness. */
+/* 2026-09-26 REDESIGN v3 (reviewing agent's proposal, "lighter by 2 shades"):
+   the v2 near-black canvas/pane (#090a0f/#111318) moves to a lighter
+   charcoal (#1D1F23/#26292E) — same architecture (unified bg, no per-tag
+   full-fill), just a lighter overall value. Re-verified against the new
+   light text: 11.5-13.3:1 primary, comfortable margin.
+   Also adds a subtle border + border-radius to main/.cds-root/.dframe-
+   content, aiming for a "floating rounded card" look. Flagging this
+   honestly rather than letting it go undocumented: each CCC tile is its
+   own separate, fully opaque Electron WebContentsView, and html/body
+   here still carry the SAME solid background as the elements being
+   rounded — rounding an element's corners only shows something different
+   if what's BEHIND it differs, and it doesn't. This is harmless to leave
+   in (no downside), but it likely won't produce a visually distinct
+   rounded shape without also making this view's own background
+   transparent at the Electron level (main.js) so the BaseWindow's
+   TILE_GAP color can show through the rounded corners — that's a real
+   but separate change, not included here. */
+*, html, body, :root {
+  --bg-000: #1D1F23 !important;
+  --bg-100: #26292E !important;
+  --bg-200: #2D323A !important;
+  --bg-300: #303438 !important;
+  --bg-400: #3A3E43 !important;
+  --bg-500: #4B5158 !important;
+}
+html, body { background-color: #26292E !important; }
+main, .dframe-content, .cds-root {
+  background-color: #26292E !important;
+  /* 2026-09-26: border + border-radius REMOVED from these three. They are
+     nested inside each other, so each drew its own rounded frame: 3-4
+     concentric rectangles per tile. The tile frame now lives in exactly one
+     place, body::after (section 13). */
+  border: 0 !important;
+  border-radius: 0 !important;
+}
+/* Base text color for the whole tile — light now, not dark. `color` is
+   inherited, so this one rule covers essentially all plain prose; the
+   more specific heading/link/code rules in §10 still win for those. */
+html, body, main, .dframe-content, .cds-root { color: #f4f4f5 !important; }
+/* Same catch-all as the light-theme era, for the same reason: claude.ai
+   sets `color` explicitly on specific elements deep in its own markup
+   (the composer's typed text, an error callout) and plain inheritance
+   loses no matter how it's nested. Now that this is a DARK theme again,
+   forcing light text here is either a genuine fix (if claude.ai's own
+   text was somehow dark) or a harmless no-op (if it was already light,
+   which is likely now that background+nativeTheme finally agree) — this
+   is why the light-theme-era menu/dropdown exclusions are gone: forcing
+   light text can no longer create a dark-on-dark trap the way forcing
+   DARK text did against a native dark dropdown. <pre> stays excluded —
+   forcing one flat color inside a code block would still flatten syntax
+   highlighting into an unreadable single hue. */
+.cds-root *:not(pre):not(pre *), main *:not(pre):not(pre *) {
+  color: #f4f4f5 !important;
+}
+
+/* --------------------------------------------------------------------------
+   6. Composer: opaque + above transcript (bleed-through fix, re-anchored),
+      and kill the 24px of dead air (pt-6) above the box.
+   2026-09-26 REDESIGN v3: bg tuned from rgba(26,29,38,...) to
+   rgba(45,50,58,...) to match the lighter charcoal palette. Border/glow
+   unchanged.
+   -------------------------------------------------------------------------- */
+main div[class*="sticky"][class*="bottom-0"],
+.cds-root div[class*="sticky"][class*="bottom-0"] {
+  background-color: rgba(45, 50, 58, 0.90) !important;
+  backdrop-filter: blur(7px) !important;
+  border-top: 1px solid rgba(255, 255, 255, 0.10) !important;
+  box-shadow: 0 -8px 24px rgba(168, 85, 247, 0.08) !important;
+  z-index: 40 !important;
+  padding-top: 6px !important;
+}
+
+/* --------------------------------------------------------------------------
+   7. Per-tile "Claude is AI and can make mistakes" strip: hidden here,
+      relocated to the CCC window title (see main.js) — visible at all
+      times while CCC runs, just not 5x over.
+   -------------------------------------------------------------------------- */
+.text-xs.text-center.text-muted.bg-surface-1,
+.cds-root [class*="bg-surface-1"][class*="text-center"][class*="text-xs"] {
+  display: none !important;
+}
+
+/* --------------------------------------------------------------------------
+   8. Per-tile top strip (chat title + Share): ~48px of button, halve it.
+      The strip's height derives from its buttons, so compacting the buttons
+      compacts the bar. Measured: Share cluster lives in a
+      md:absolute md:right-0 md:top-0 container; on narrow tiles the
+      max-md:inset-x-0 max-md:top-0 overlay hosts the whole strip.
+   -------------------------------------------------------------------------- */
+.cds-root [class*="max-md:inset-x-0"][class*="max-md:top-0"] button,
+.cds-root [class*="md:right-0"][class*="md:top-0"] button {
+  height: 22px !important;
+  min-height: 22px !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  font-size: 11.5px !important;
+}
+
+/* --------------------------------------------------------------------------
+   9. "Switched to <model> / Edit and retry" banner -> one compact line.
+      Measured: card = [rounded-t-*] with pt-2 pb-7 -mb-5 tucked under the
+      composer; inner row = flex-wrap (wraps to 2 lines in narrow tiles).
+   -------------------------------------------------------------------------- */
+main div[class*="sticky"][class*="bottom-0"] [class*="rounded-t-"],
+.cds-root div[class*="sticky"][class*="bottom-0"] [class*="rounded-t-"] {
+  padding-top: 1px !important;
+  padding-bottom: 22px !important;
+}
+.cds-root div[class*="sticky"][class*="bottom-0"] [class*="rounded-t-"] [class*="flex-wrap"] {
+  flex-wrap: nowrap !important;
+  column-gap: 8px !important;
+  font-size: 10.5px !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+}
+.cds-root div[class*="sticky"][class*="bottom-0"] [class*="rounded-t-"] [class*="flex-wrap"] > * {
+  min-width: 0 !important;
+  white-space: nowrap !important;
+}
+
+/* --------------------------------------------------------------------------
+   10. Batch-2 (2026-08-06). (a) The title strip's CONTAINER is h-12 (48px);
+       §9's button compaction alone left the band tall — force the container.
+       (b) Reclaim remaining width: the max-w-[50.5rem] px-5 wrapper, the
+       px-4 list column, bubble padding, and dframe-content-inner gutters.
+
+   2026-09-26 v3: this used to be TWO separate .dframe-header blocks — this
+   one setting height:24px, then a second "9. Batch-2 tighten" block further
+   down silently overriding it to 20px/10.5px (same specificity, later in
+   source wins). That second block was live all along; this first one was
+   dead code. Merged into one block below at 24px/11.5px — a genuine height
+   increase from what was actually rendering, not just a cleanup, so this
+   changes real visible behavior: the tile header is 4px taller now.
+   -------------------------------------------------------------------------- */
+.dframe-header {
+  height: 24px !important;
+  min-height: 24px !important;
+  max-height: 24px !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  gap: 6px !important;
+}
+.dframe-header, .dframe-header * {
+  color: #d4d4d8 !important;
+  font-size: 11.5px !important;
+  line-height: 1.15 !important;
+  min-height: 0 !important;
+  max-height: 24px !important;
+}
+.dframe-header button, .dframe-header a {
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  padding-left: 6px !important;
+  padding-right: 6px !important;
+}
+.dframe-header svg { width: 12px !important; height: 12px !important; }
+
+main [class*="50.5rem"] { max-width: 100% !important; }
+main [class*="px-5"]   { padding-left: 6px !important; padding-right: 6px !important; }
+main [class*="px-4"]   { padding-left: 6px !important; padding-right: 6px !important; }
+.dframe-content-inner  { padding-left: 4px !important; padding-right: 4px !important; }
+main [class*="rounded-card"] { padding-left: 10px !important; padding-right: 10px !important; }
+
+/* Let text use the tile: tighter row gutters, shallower list indents,
+   user bubbles can span nearly the full column. */
+main [class*="px-lg"] { padding-left: 5px !important; padding-right: 5px !important; }
+main div[class*="max-w-"],
+main [class*="mx-auto"] { padding-left: 6px !important; padding-right: 6px !important; }
+main [class*="prose"] ul, main [class*="prose"] ol { padding-inline-start: 18px !important; }
+main [class*="max-w-[85%]"] { max-width: 100% !important; }
+/* claude.ai pads every response paragraph 32px on the right — with the row
+   cap above, text stopped at ~75% of the tile (measured 2026-08-06). */
+main [class*="claude-response-body"],
+main .font-claude-response-body,
+main [class*="font-claude-response"] { padding-right: 0 !important; }
+
+
+/* ==========================================================================
+   10. Accents. 2026-09-26 REDESIGN v2: bright accents for a dark theme —
+       violet/sky/amber, all verified against the new pane bg (7.0-11.1:1,
+       comfortable margin). Scroll-arrow fix is a best-effort selector
+       guess (claude.ai's real class names for it aren't visible from
+       outside); flagged in case it needs another look.
+   ========================================================================== */
+.cds-root .font-claude-response-body { padding-left: 4px !important; }
+.cds-root main h1, .cds-root main h2, .cds-root main h3,
+.cds-root [class*="prose"] h1, .cds-root [class*="prose"] h2, .cds-root [class*="prose"] h3 {
+  color: #c084fc !important;
+  text-shadow: none !important;
+}
+.cds-root main a {
+  color: #38bdf8 !important;
+  text-shadow: none !important;
+}
+.cds-root main code:not(pre code) {
+  color: #fbbf24 !important;
+  background: rgba(251, 191, 36, 0.10) !important;
+}
+.cds-root main blockquote { border-left: 3px solid #a855f7 !important; }
+.cds-root ::-webkit-scrollbar-thumb { background: #3f3f46 !important; border-radius: 4px; }
+/* "Scroll to latest" floating button (2026-09-26, Frank: "Cant see the
+   arrow. Make the circles background color a few shades lighter."): a
+   circular button that floats over the transcript, dark-on-dark against
+   the current theme. Best-effort selector — claude.ai's own class names
+   for it are unknown from outside, so this targets the common aria-label
+   wording apps use for this exact control; if the real button uses
+   different wording this won't catch it and needs another look. */
+main button[aria-label*="scroll" i],
+.cds-root button[aria-label*="scroll" i],
+main button[aria-label*="latest" i],
+.cds-root button[aria-label*="latest" i],
+main button[aria-label*="new message" i],
+.cds-root button[aria-label*="new message" i] {
+  background-color: rgba(160, 160, 170, 0.55) !important;
+}
+/* User messages: 2026-09-26 v3 — solid lighter-charcoal fill + violet-
+   tinted border, replacing the neutral-gray translucent fill. Verified:
+   #f4f4f5 text vs #2D323A bg still clears easily (11.7:1, same family as
+   the pane/composer contrast already checked). */
+.cds-root [class*="group/message-row"][class*="ms-auto"] [class*="rounded"] {
+  background-color: #2D323A !important;
+  border: 1px solid rgba(168, 85, 247, 0.4) !important;
+}
+
+
+/* ==========================================================================
+   11. Composer readability pass (2026-08-07, Frank spec).
+   2026-09-26 REDESIGN v2 ("Start with this" design brief): input dock is
+   dark now, not purple — superseding the ad-hoc purple-composer request
+   from before the brief existed. Text stays light (zinc-100 primary /
+   zinc-400 secondary).
+   2026-09-26 v3: bg tuned to #2D323A (lighter charcoal) with a 12px
+   border-radius added. Unlike §5's border-radius on main/.cds-root (which
+   likely won't show — see that section's note), this one has a real
+   chance of actually being visible: the composer box's own bg (#2D323A)
+   sits inside a slightly different parent (§6's sticky footer, rgba(45,
+   50,58,0.90) ≈ #2D323A at full opacity — close but not pixel-identical
+   once blended with whatever's scrolling underneath it), so there's an
+   actual, if subtle, color boundary at the edge for the radius to reveal.
+   Text re-verified: 15.3:1 / 6.6:1 (unchanged from v2, bg lightness shift
+   this small doesn't meaningfully move the contrast ratio). */
+main div[class*="sticky"][class*="bottom-0"] [class*="bg-surface-3"] {
+  background-color: #2D323A !important;
+  border: 1px solid rgba(255, 255, 255, 0.10) !important;
+  border-radius: 12px !important;
+}
+main div[class*="sticky"][class*="bottom-0"] button { font-weight: 700 !important; }
+main div[class*="sticky"][class*="bottom-0"] [class*="text-muted"],
+main div[class*="sticky"][class*="bottom-0"] [class*="text-secondary"] {
+  color: #a1a1aa !important;
+  font-weight: 400 !important;
+}
+main div[class*="sticky"][class*="bottom-0"] .is-editor-empty::before,
+main div[class*="sticky"][class*="bottom-0"] [data-placeholder]::before {
+  color: #a1a1aa !important;
+  opacity: 0.9 !important;
+}
+/* The actual typed text — inheritance alone (§5) doesn't reach this;
+   claude.ai's editor sets its own color on the text nodes it renders. */
+main div[class*="sticky"][class*="bottom-0"] div[contenteditable="true"],
+main div[class*="sticky"][class*="bottom-0"] div[contenteditable="true"] * {
+  color: #f4f4f5 !important;
+}
+
+/* ==========================================================================
+   12 + 13. Per-tile tag color and active-tile indicator: ONE frame per tile.
+
+   2026-09-26 rewrite. Frank's screenshots showed every tile wrapped in 3-4
+   concentric frames. Cause: the tag accent line, active ring, border and
+   radius were applied to main, .cds-root AND .dframe-content, which are
+   nested inside each other, so each element painted its own frame at its
+   own inset. Pixel-sampling single points passed while the whole looked
+   broken. Now: none of those elements get box-shadow or border. The frame
+   is a single position:fixed overlay (body::after) covering the whole tile
+   view, inset shadows only (a tile is its own clipped WebContentsView, so
+   anything drawn outside its rectangle never renders; inset stays inside).
+   pointer-events:none so it never eats clicks.
+
+   Composition, one declaration per state so nothing gets clobbered:
+     untagged + inactive : no frame at all
+     tagged   + inactive : 3px left line in the tag color
+     untagged + active   : 2px violet ring all the way round
+     tagged   + active   : 2px violet ring + 4px tag line on the left
+   The 2px violet->indigo gradient bar on top (body::before) stays as the
+   second active cue.
+
+   'black' tag uses #a1a1aa for the line (true black is invisible on a dark
+   pane), matching the swatch and topbar dot.
+   ========================================================================== */
+main, .cds-root, .dframe-content { box-shadow: none !important; }
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none !important;
+  z-index: 999998;
+  box-shadow: none;
+}
+body.ccc-color-green::after  { box-shadow: inset 3px 0 0 0 #22c55e !important; }
+body.ccc-color-red::after    { box-shadow: inset 3px 0 0 0 #ef4444 !important; }
+body.ccc-color-black::after  { box-shadow: inset 3px 0 0 0 #a1a1aa !important; }
+body.ccc-color-yellow::after { box-shadow: inset 3px 0 0 0 #eab308 !important; }
+body.ccc-color-blue::after   { box-shadow: inset 3px 0 0 0 #3b82f6 !important; }
+
+body.ccc-active::after { box-shadow: inset 0 0 0 2px #a855f7 !important; }
+body.ccc-active.ccc-color-green::after  { box-shadow: inset 6px 0 0 0 #22c55e, inset 0 0 0 2px #a855f7 !important; }
+body.ccc-active.ccc-color-red::after    { box-shadow: inset 6px 0 0 0 #ef4444, inset 0 0 0 2px #a855f7 !important; }
+body.ccc-active.ccc-color-black::after  { box-shadow: inset 6px 0 0 0 #a1a1aa, inset 0 0 0 2px #a855f7 !important; }
+body.ccc-active.ccc-color-yellow::after { box-shadow: inset 6px 0 0 0 #eab308, inset 0 0 0 2px #a855f7 !important; }
+body.ccc-active.ccc-color-blue::after   { box-shadow: inset 6px 0 0 0 #3b82f6, inset 0 0 0 2px #a855f7 !important; }
+
+/* Active tile: slightly lighter pane, background only. */
+body.ccc-active,
+body.ccc-active main,
+body.ccc-active .cds-root,
+body.ccc-active .dframe-content {
+  background-color: #303438 !important;
+}
+body.ccc-active::before {
+  content: "";
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, #a855f7, #6366f1) !important;
+  z-index: 999999;
+  pointer-events: none !important;
+}
+
+/* Color pad: keep the header from clipping it. */
+.dframe-header { overflow: visible !important; }
+#ccc-colorpad { flex-shrink: 0 !important; }
+
+/* ==========================================================================
+   14. claude.ai hardcoded #151515 wrappers (2026-09-26). Sampled live: a
+       near-black band around the composer and behind the tile header strip,
+       #151515, a value that appears nowhere in our palette. claude.ai sets
+       it directly on wrapper divs instead of via the --bg-XXX tokens, so the
+       theme never reached them. Made transparent so the pane color shows
+       through. The composer box itself (bg-surface-3) keeps its own fill.
+   ========================================================================== */
+.dframe-header { background-color: transparent !important; }
+main div[class*="sticky"][class*="bottom-0"] div:not([class*="bg-surface-3"]):not([class*="bg-surface-3"] *),
+.cds-root div[class*="sticky"][class*="bottom-0"] div:not([class*="bg-surface-3"]):not([class*="bg-surface-3"] *) {
+  background-color: transparent !important;
 }

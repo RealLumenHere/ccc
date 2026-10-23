@@ -7,7 +7,7 @@
   "author": "Frank Stupak",
   "license": "MIT",
   "scripts": {
-    "start": "electron .",
+    "start": "electron . --no-sandbox",
     "start:verbose": "ELECTRON_ENABLE_LOGGING=1 CCC_DEBUG=1 electron .",
     "dist": "electron-builder"
   },

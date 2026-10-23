@@ -1,29 +1,40 @@
 <!doctype html>
 <meta charset="utf-8" />
 <style>
-  :root { color-scheme: dark; }
+  :root { color-scheme: dark;
+    /* 2026-09-26 REDESIGN v3 (reviewing agent's proposal): lighter charcoal
+       canvas replaces the near-black v2 palette (#090a0f -> #1D1F23), same
+       violet active accent. Verified against the v3 pane/composer bg. */
+    --bg:#1D1F23; --text:#e4e4e7; --dim:#8b8b93;
+    --surf:#26292E; --surf-h:#303438; --border:#3A3E43;
+    --active-bg:#303438; --active-bd:#a855f7; }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; overflow: hidden;
-    background: #111; color: #e6e6e6;
-    font: 12px/1.2 -apple-system, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+    font: 11px/1.3 'OpenDyslexic', 'Atkinson Hyperlegible', -apple-system, 'Segoe UI', Roboto, sans-serif;
     -webkit-user-select: none; user-select: none; }
-  .bar { display: flex; align-items: center; height: 40px; gap: 6px; padding: 0 6px; }
-  button { background: #222; color: #ddd; border: 1px solid #333; border-radius: 6px;
-    height: 26px; padding: 0 8px; cursor: pointer; font: inherit; }
-  button:hover { background: #2c2c2c; }
-  .icon { width: 26px; padding: 0; font-size: 15px; line-height: 1; }
+  .bar { display: flex; align-items: center; height: 28px; gap: 6px; padding: 0 6px; }
+  button { background: var(--surf); color: var(--text); border: 1px solid var(--border); border-radius: 5px;
+    height: 20px; padding: 0 7px; cursor: pointer; font: inherit; }
+  button:hover { background: var(--surf-h); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  .icon { width: 20px; padding: 0; font-size: 13px; line-height: 1; }
   #tabs { display: flex; align-items: center; gap: 4px; flex: 1; overflow: hidden; }
   .chip { display: flex; align-items: center; gap: 6px; max-width: 200px;
-    height: 26px; padding: 0 6px 0 10px; border: 1px solid #333; border-radius: 6px;
-    background: #1c1c1c; cursor: pointer; white-space: nowrap; }
+    height: 20px; padding: 0 5px 0 8px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--surf); color: var(--text); cursor: pointer; white-space: nowrap; font-weight: 700; }
+  .chip:hover { background: var(--surf-h); }
   .chip .t { overflow: hidden; text-overflow: ellipsis; }
-  .chip.active { background: #3a2f1e; border-color: #7a5a24; }
-  .chip.offscreen { opacity: 0.55; }
-  .chip .x { opacity: 0.5; font-size: 13px; }
-  .chip .x:hover { opacity: 1; color: #ff8a80; }
-  .pager { display: flex; align-items: center; gap: 4px; color: #999; }
+  .chip .dot { width: 7px; height: 7px; min-width: 7px; border-radius: 2px;
+    border: 1px solid rgba(255,255,255,0.35); }
+  .chip.active { background: var(--active-bg); border-color: var(--active-bd); color: #e8e8e8; }
+  .chip.offscreen { opacity: 0.5; }
+  .chip.dragging { opacity: 0.35; }
+  .chip .x { opacity: 0.5; font-size: 11px; }
+  .chip .x:hover { opacity: 1; color: #e0885a; }
+  .pager { display: flex; align-items: center; gap: 4px; color: var(--dim); }
   .pager .rng { min-width: 54px; text-align: center; }
-  .sp { flex: 0 0 1px; height: 20px; background: #333; margin: 0 2px; }
+  .sp { flex: 0 0 1px; height: 16px; background: var(--border); margin: 0 2px; }
 </style>
 
 <div class="bar">
@@ -42,6 +53,7 @@
 
 <script>
   const $ = (s) => document.querySelector(s);
+  const COLOR_HEX = { green:'#22c55e', red:'#ef4444', black:'#a1a1aa', yellow:'#eab308', blue:'#3b82f6' }; // 'gray' removed 2026-09-26; 'black' matched to the tile accent's neutral (2026-09-26 v3) rather than true #000, which read as invisible on a dark dot
   $('#add').onclick  = () => window.ccc.send('ccc:newTab');
   $('#prev').onclick = () => window.ccc.send('ccc:page', -1);
   $('#next').onclick = () => window.ccc.send('ccc:page', +1);
@@ -54,15 +66,40 @@
       const onscreen = i >= st.pageOffset && i < st.pageOffset + st.columns;
       const chip = document.createElement('div');
       chip.className = 'chip' + (t.id === st.activeId ? ' active' : '') + (onscreen ? '' : ' offscreen');
+      if (t.color && COLOR_HEX[t.color]) {
+        const dot = document.createElement('span');
+        dot.className = 'dot'; dot.style.background = COLOR_HEX[t.color];
+        chip.appendChild(dot);
+      }
       const label = document.createElement('span');
       label.className = 't'; label.textContent = t.title;
       const x = document.createElement('span');
       x.className = 'x'; x.textContent = '×';
       x.onclick = (e) => { e.stopPropagation(); window.ccc.send('ccc:closeTab', t.id); };
       chip.onclick = () => window.ccc.send('ccc:focusTab', t.id);
+      chip.draggable = true;
+      chip.ondragstart = (e) => { e.dataTransfer.setData('text/plain', String(t.id)); e.dataTransfer.effectAllowed = 'move'; chip.classList.add('dragging'); };
+      chip.ondragend = () => chip.classList.remove('dragging');
+      chip.ondragover = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; };
+      chip.ondrop = (e) => {
+        e.preventDefault(); e.stopPropagation();
+        const dragId = Number(e.dataTransfer.getData('text/plain'));
+        if (!dragId || dragId === t.id) return;
+        const r = chip.getBoundingClientRect();
+        const after = (e.clientX - r.left) > r.width / 2;
+        let target = i + (after ? 1 : 0);
+        const from = st.tabs.findIndex((x) => x.id === dragId);
+        if (from !== -1 && from < target) target -= 1;
+        window.ccc.send('ccc:moveTab', { id: dragId, toIndex: target });
+      };
       chip.appendChild(label); chip.appendChild(x);
       box.appendChild(chip);
     });
+    box.ondragover = (e) => { e.preventDefault(); };
+    box.ondrop = (e) => {
+      const dragId = Number(e.dataTransfer.getData('text/plain'));
+      if (dragId) window.ccc.send('ccc:moveTab', { id: dragId, toIndex: st.tabs.length - 1 });
+    };
     const first = st.pageOffset + 1;
     const last = Math.min(st.pageOffset + st.columns, st.tabs.length);
     $('#rng').textContent = st.tabs.length ? `${first}–${last}/${st.tabs.length}` : '–';

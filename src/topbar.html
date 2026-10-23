@@ -1,0 +1,98 @@
+<!doctype html>
+<meta charset="utf-8" />
+<style>
+  :root { color-scheme: dark;
+    --bg:#0f1826; --text:#d8e0ee; --dim:#8895ad;
+    --surf:#182338; --surf-h:#21304a; --border:#2a3a55;
+    --active-bg:#223350; --active-bd:#d0894a; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--text);
+    font: 11px/1.3 'OpenDyslexic', 'Atkinson Hyperlegible', -apple-system, 'Segoe UI', Roboto, sans-serif;
+    -webkit-user-select: none; user-select: none; }
+  .bar { display: flex; align-items: center; height: 28px; gap: 6px; padding: 0 6px; }
+  button { background: var(--surf); color: var(--text); border: 1px solid var(--border); border-radius: 5px;
+    height: 20px; padding: 0 7px; cursor: pointer; font: inherit; }
+  button:hover { background: var(--surf-h); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  .icon { width: 20px; padding: 0; font-size: 13px; line-height: 1; }
+  #tabs { display: flex; align-items: center; gap: 4px; flex: 1; overflow: hidden; }
+  .chip { display: flex; align-items: center; gap: 6px; max-width: 200px;
+    height: 20px; padding: 0 5px 0 8px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--surf); color: var(--text); cursor: pointer; white-space: nowrap; }
+  .chip:hover { background: var(--surf-h); }
+  .chip .t { overflow: hidden; text-overflow: ellipsis; }
+  .chip.active { background: var(--active-bg); border-color: var(--active-bd); color: #f0f4fb; }
+  .chip.offscreen { opacity: 0.5; }
+  .chip.dragging { opacity: 0.35; }
+  .chip .x { opacity: 0.5; font-size: 11px; }
+  .chip .x:hover { opacity: 1; color: #e0885a; }
+  .pager { display: flex; align-items: center; gap: 4px; color: var(--dim); }
+  .pager .rng { min-width: 54px; text-align: center; }
+  .sp { flex: 0 0 1px; height: 16px; background: var(--border); margin: 0 2px; }
+</style>
+
+<div class="bar">
+  <button class="icon" id="add" title="New chat (Ctrl+T)">＋</button>
+  <div class="sp"></div>
+  <div id="tabs"></div>
+  <div class="sp"></div>
+  <div class="pager">
+    <button class="icon" id="prev" title="Scroll left (Ctrl+←)">‹</button>
+    <span class="rng" id="rng">–</span>
+    <button class="icon" id="next" title="Scroll right (Ctrl+→)">›</button>
+  </div>
+  <div class="sp"></div>
+  <button id="side" title="Toggle sidebar in active chat">☰ sidebar</button>
+</div>
+
+<script>
+  const $ = (s) => document.querySelector(s);
+  $('#add').onclick  = () => window.ccc.send('ccc:newTab');
+  $('#prev').onclick = () => window.ccc.send('ccc:page', -1);
+  $('#next').onclick = () => window.ccc.send('ccc:page', +1);
+  $('#side').onclick = () => window.ccc.send('ccc:toggleSidebar');
+
+  window.ccc.on('tabs', (st) => {
+    const box = $('#tabs');
+    box.innerHTML = '';
+    st.tabs.forEach((t, i) => {
+      const onscreen = i >= st.pageOffset && i < st.pageOffset + st.columns;
+      const chip = document.createElement('div');
+      chip.className = 'chip' + (t.id === st.activeId ? ' active' : '') + (onscreen ? '' : ' offscreen');
+      const label = document.createElement('span');
+      label.className = 't'; label.textContent = t.title;
+      const x = document.createElement('span');
+      x.className = 'x'; x.textContent = '×';
+      x.onclick = (e) => { e.stopPropagation(); window.ccc.send('ccc:closeTab', t.id); };
+      chip.onclick = () => window.ccc.send('ccc:focusTab', t.id);
+      chip.draggable = true;
+      chip.ondragstart = (e) => { e.dataTransfer.setData('text/plain', String(t.id)); e.dataTransfer.effectAllowed = 'move'; chip.classList.add('dragging'); };
+      chip.ondragend = () => chip.classList.remove('dragging');
+      chip.ondragover = (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; };
+      chip.ondrop = (e) => {
+        e.preventDefault(); e.stopPropagation();
+        const dragId = Number(e.dataTransfer.getData('text/plain'));
+        if (!dragId || dragId === t.id) return;
+        const r = chip.getBoundingClientRect();
+        const after = (e.clientX - r.left) > r.width / 2;
+        let target = i + (after ? 1 : 0);
+        const from = st.tabs.findIndex((x) => x.id === dragId);
+        if (from !== -1 && from < target) target -= 1;
+        window.ccc.send('ccc:moveTab', { id: dragId, toIndex: target });
+      };
+      chip.appendChild(label); chip.appendChild(x);
+      box.appendChild(chip);
+    });
+    box.ondragover = (e) => { e.preventDefault(); };
+    box.ondrop = (e) => {
+      const dragId = Number(e.dataTransfer.getData('text/plain'));
+      if (dragId) window.ccc.send('ccc:moveTab', { id: dragId, toIndex: st.tabs.length - 1 });
+    };
+    const first = st.pageOffset + 1;
+    const last = Math.min(st.pageOffset + st.columns, st.tabs.length);
+    $('#rng').textContent = st.tabs.length ? `${first}–${last}/${st.tabs.length}` : '–';
+    $('#prev').disabled = st.pageOffset <= 0;
+    $('#next').disabled = st.pageOffset >= st.maxOffset;
+  });
+</script>

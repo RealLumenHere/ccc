@@ -4,31 +4,85 @@ const path = require('path');
 const fs = require('fs');
 const {
   app, BaseWindow, WebContentsView, session,
-  ipcMain, globalShortcut, Menu, nativeTheme
+  ipcMain, globalShortcut, Menu, nativeTheme, shell
 } = require('electron');
+
+// Google blocks OAuth in embedded webviews when UA advertises Electron
+app.userAgentFallback = app.userAgentFallback.replace(/\sElectron\/\S+/, "").replace(/\sclaude-command-center\/\S+/i, "");
 
 const CFG = require('./config');
 const store = require('./persistence');
+const cccOps = require('./ccc-ops');
+const cccSyncMod = require('./ccc-sync');   // wq#2036, OFF unless CCC_SYNC=1 or userData/ccc-sync.enabled
+
+// Per-tile ID color tag (2026-09-25, 'white'->'blue' + 'gray' removed
+// 2026-09-26, Frank spec). Single source of truth so createTab()'s restore
+// path and the ccc:setColor handler can't drift out of sync with each other.
+const VALID_COLORS = ['green', 'red', 'black', 'yellow', 'blue'];
+
+// Single instance: clicking the launcher while CCC is already open focuses
+// the existing window instead of spawning a second copy (2026-08-06). A
+// second instance also corrupts tile loads by fighting over the profile lock.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (!win) return;
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+  });
+}
 
 // Touch support: Chromium X11 touch auto-detection is unreliable; force-enable
-// so the wch.cn bar touchscreen scrolls instead of selecting text. (2026-07-09)
+// so the wch.cn bar touchscreen scrolls instead of selecting text. (2026-07-09,
+// reconciled from Thor's live copy 2026-07-11)
 app.commandLine.appendSwitch('touch-events', 'enabled');
+
+// Load-speed: keep a big HTTP disk cache so claude.ai's frequently-redeployed,
+// hash-named JS bundles + fonts survive restarts instead of being evicted, and
+// let Chromium download subresources in parallel to shorten cold tile boots.
+// (2026-07-13)
+app.commandLine.appendSwitch('disk-cache-size', String(1024 * 1024 * 1024)); // 1 GiB
+app.commandLine.appendSwitch('enable-features', 'ParallelDownloading');
 
 // --- injected assets (read once) -------------------------------------------
 const INJECT_DIR = path.join(__dirname, 'inject');
 const VIEW_CSS = fs.readFileSync(path.join(INJECT_DIR, 'styles.css'), 'utf8');
 const AUTOMATIONS_JS = fs.readFileSync(path.join(INJECT_DIR, 'automations.js'), 'utf8');
+// Skim layer (2026-08-10): core MUST load before the driver — the driver
+// no-ops if window.CCCSkim is absent. Both fail soft if the files vanish.
+const SKIM_CORE_JS = fs.existsSync(path.join(INJECT_DIR, 'skim-core.js'))
+  ? fs.readFileSync(path.join(INJECT_DIR, 'skim-core.js'), 'utf8') : '';
+const SKIM_INJECT_JS = fs.existsSync(path.join(INJECT_DIR, 'skim-inject.js'))
+  ? fs.readFileSync(path.join(INJECT_DIR, 'skim-inject.js'), 'utf8') : '';
 
 // --- runtime state ----------------------------------------------------------
 let win = null;              // BaseWindow
 let topbar = null;           // WebContentsView (our chrome)
 let bottombar = null;        // WebContentsView (our chrome)
 let claudeSession = null;    // shared persistent session (single sign-on)
+let cccSync = null;          // cross-machine open-chat sync (wq#2036); null = disabled = zero behavior change
 let tabs = [];               // MRU-ordered: index 0 = most recent. { id, view, url, title, lastActive, sidebarExpanded }
 let activeId = null;
 let pageOffset = 0;
 let nextId = 1;
 let restoring = false;       // suppress MRU reordering while a saved session restores
+
+// Manual tile-width resize (2026-09-25, REDESIGNED 2026-09-26): width follows
+// the TAB, not the column position. Frank: "resizes shift when i move chats"
+// — correct, because colFracs used to be indexed by COLUMN, so a tab's width
+// depended on which slot it happened to land in, not on which tab it was.
+// Now each tab carries its own optional widthFrac (fraction of the row's
+// available width); tabs without one split whatever's left equally. This
+// travels with the tab through reorders, paging, and restarts.
+let resizeDrag = null;       // { handleIndex, tabA, tabB, startScreenX, wA, wB, columns, gap, avail } while dragging
+let handles = [];            // resize-handle WebContentsViews, one per gap: handles[i] sits between
+                              // column i and column i+1. Array position IS the gap index — handles
+                              // are never reordered, only appended/popped as column count changes.
+
+// Global chat-tile zoom (2026-09-25) ------------------------------------------
+let zoomFactor = CFG.ZOOM_DEFAULT;   // applies to every tile's webContents at once, never the chrome bars
 
 const DBG = (...a) => { if (process.env.CCC_DEBUG) console.log('[ccc]', ...a); };
 
@@ -61,6 +115,98 @@ function computeColumns(width) {
   return Math.max(1, Math.min(c, CFG.MAX_COLUMNS, Math.max(1, tabs.length)));
 }
 
+// Splits the row's available width among the currently VISIBLE tabs. A tab
+// with an explicit widthFrac (set by dragging) gets exactly that share; tabs
+// without one split whatever's left equally. If manually-set fractions ever
+// sum past 92% (many tabs resized against each other), they're scaled down
+// so no auto tab is squeezed to nothing — a soft clamp, not a hard reset.
+function widthsForVisible(visibleTabs, avail) {
+  const n = visibleTabs.length;
+  if (n === 0) return [];
+  const explicit = visibleTabs.map((t) => (typeof t.widthFrac === 'number' && t.widthFrac > 0) ? t.widthFrac : null);
+  const explicitSum = explicit.reduce((s, f) => s + (f || 0), 0);
+  const autoCount = explicit.filter((f) => f === null).length;
+  let fracs;
+  if (autoCount === 0) {
+    fracs = explicitSum > 0 ? explicit.map((f) => f / explicitSum) : visibleTabs.map(() => 1 / n);
+  } else {
+    const cap = 0.92;
+    const scale = explicitSum > cap ? cap / explicitSum : 1;
+    const autoShare = (1 - explicitSum * scale) / autoCount;
+    fracs = explicit.map((f) => (f === null ? autoShare : f * scale));
+  }
+  const widths = fracs.map((f) => Math.round(f * avail));
+  const sum = widths.reduce((a, b) => a + b, 0);
+  widths[widths.length - 1] += (avail - sum); // rounding remainder -> last column
+  return widths;
+}
+
+// Positions every tile per current per-tab widths; returns the widths, xs,
+// and the visible-tab list so callers (relayout, syncHandles, live drag)
+// share one source of truth instead of recomputing the partition twice.
+function layoutRow(W, top, midH, columns, gap) {
+  const visible = tabs.slice(pageOffset, pageOffset + columns);
+  const avail = Math.max(0, W - gap * (columns - 1));
+  const widths = widthsForVisible(visible, avail);
+  const xs = [];
+  let x = 0;
+  for (let i = 0; i < columns; i++) { xs.push(x); x += (widths[i] || 0) + gap; }
+
+  tabs.forEach((t) => {
+    const vi = visible.indexOf(t);
+    if (vi === -1) {
+      t._visible = false;
+      t.view.setVisible(false);
+    } else {
+      t.view.setBounds({ x: xs[vi], y: top, width: widths[vi], height: midH });
+      t._visible = true;
+      t.view.setVisible(true);
+    }
+  });
+  return { widths, xs, visible };
+}
+
+// Manual tile-width resize (2026-09-25): one thin WebContentsView per gap
+// between adjacent columns, TILE_GAP wide, spanning full tile height (no
+// vertical resize exists anywhere in CCC). Kept in sync with column count
+// here; a currently-dragged handle is skipped — main.js expanded it to the
+// full row width in ccc:resizeStart and owns its bounds until resizeEnd.
+function syncHandles(columns, top, midH, gap, xs, widths) {
+  const need = Math.max(0, columns - 1);
+  while (handles.length < need) {
+    const view = new WebContentsView({
+      webPreferences: { preload: path.join(__dirname, 'preload-shell.js'), contextIsolation: true, nodeIntegration: false }
+    });
+    view.setBackgroundColor('#00000000');
+    view.webContents.loadFile(path.join(__dirname, 'renderer', 'handle.html'));
+    attachAppKeys(view.webContents);
+    win.contentView.addChildView(view);
+    handles.push({ view });
+  }
+  while (handles.length > need) {
+    const h = handles.pop();
+    try { win.contentView.removeChildView(h.view); h.view.webContents.close(); } catch (_e) {}
+    if (resizeDrag && resizeDrag.handleIndex >= handles.length) resizeDrag = null;
+  }
+  // Re-raise every handle to the TOP of the z-order on every call (cheap:
+  // remove+re-add). Handles are created lazily as columns appear, but tabs
+  // reorder (MRU unshift on createTab), so a tile view added AFTER a handle
+  // can end up spatially wherever that handle now lives and silently cover
+  // it — clicks land on the tile underneath instead of the handle. This bug
+  // is exactly what made the first live test miss every time. Handles must
+  // always sit above every tile regardless of creation order.
+  handles.forEach((h) => {
+    try { win.contentView.removeChildView(h.view); win.contentView.addChildView(h.view); } catch (_e) {}
+  });
+  for (let i = 0; i < handles.length; i++) {
+    if (resizeDrag && resizeDrag.handleIndex === i) continue; // owned mid-drag
+    handles[i].view.setBounds({ x: xs[i] + widths[i], y: top, width: gap, height: midH });
+  }
+  if (process.env.CCC_DEBUG) {
+    DBG('handle bounds', handles.map((h, i) => ({ i, x: xs[i] + widths[i], w: gap, top, midH })));
+  }
+}
+
 function relayout() {
   if (!win) return;
   const [W, H] = win.getContentSize();
@@ -76,31 +222,42 @@ function relayout() {
   if (pageOffset > maxOffset) pageOffset = maxOffset;
   if (pageOffset < 0) pageOffset = 0;
 
-  const tileW = Math.floor(W / columns);
-  const visible = tabs.slice(pageOffset, pageOffset + columns);
-
-  tabs.forEach((t) => {
-    const vi = visible.indexOf(t);
-    if (vi === -1) {
-      t._visible = false;
-      t.view.setVisible(false);
-    } else {
-      const isLast = vi === columns - 1;
-      const x = vi * tileW;
-      const w = isLast ? (W - x) : tileW; // last column eats rounding remainder
-      t.view.setBounds({ x, y: top, width: w, height: midH });
-      t._visible = true;
-      t.view.setVisible(true);
-    }
-  });
+  const gap = CFG.TILE_GAP || 0;
+  const { widths, xs } = layoutRow(W, top, midH, columns, gap);
+  syncHandles(columns, top, midH, gap, xs, widths);
 
   pushTabStrip(columns, maxOffset);
+}
+
+// Applies one live drag-move to the two TABS adjacent to the dragged handle
+// (captured by reference at resizeStart, not by column position — that's the
+// 2026-09-26 fix), converts the result back to a fraction of the row's total
+// width, and repositions tiles + every OTHER handle for real-time feedback.
+function applyDrag(screenX) {
+  if (!resizeDrag) return;
+  const { tabA, tabB, startScreenX, wA, wB, columns, gap, avail } = resizeDrag;
+  const minW = CFG.MIN_COLUMN_WIDTH || 100;
+  const delta = screenX - startScreenX;
+  const newWA = Math.max(minW, Math.min(wA + wB - minW, wA + delta));
+  const newWB = wA + wB - newWA;
+
+  tabA.widthFrac = newWA / avail;
+  tabB.widthFrac = newWB / avail;
+
+  const [W, H] = win.getContentSize();
+  const top = CFG.TOPBAR_HEIGHT, bot = CFG.BOTTOMBAR_HEIGHT;
+  const midH = Math.max(0, H - top - bot);
+  const { widths, xs } = layoutRow(W, top, midH, columns, gap);
+  for (let i = 0; i < handles.length; i++) {
+    if (i === resizeDrag.handleIndex) continue;
+    handles[i].view.setBounds({ x: xs[i] + widths[i], y: top, width: gap, height: midH });
+  }
 }
 
 function pushTabStrip(columns, maxOffset) {
   if (!topbar) return;
   topbar.webContents.send('tabs', {
-    tabs: tabs.map((t) => ({ id: t.id, title: t.title || 'New chat' })),
+    tabs: tabs.map((t) => ({ id: t.id, title: t.title || 'New chat', color: t.color || null })),
     activeId,
     pageOffset,
     columns,
@@ -160,42 +317,96 @@ function createTab(url, restoreMeta, opts) {
       preload: path.join(__dirname, 'preload-view.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      spellcheck: true,
       sandbox: true
     }
   });
-  view.setBackgroundColor('#1a1a1a');
+  view.setBackgroundColor('#111318'); // 2026-09-26: matches the dark-theme pane bg (design brief)
+  try { view.webContents.setZoomFactor(zoomFactor); } catch (_e) {}
 
   const tab = {
     id, view,
     url: url || CFG.START_URL,
     title: (restoreMeta && restoreMeta.title) || 'New chat',
     lastActive: Date.now(),
-    sidebarExpanded: !!(restoreMeta && restoreMeta.sidebarExpanded)
+    sidebarExpanded: !!(restoreMeta && restoreMeta.sidebarExpanded),
+    // Per-tile ID color tag (2026-09-25, 'white'->'blue' + 'gray' removed
+    // 2026-09-26, Frank spec): null|'green'|'red'|'black'|'yellow'|'blue'.
+    // New tabs default to null. Sanitized against VALID_COLORS on restore
+    // so a tag retired from the palette can't silently linger forever in
+    // ccc-state.json with no matching CSS to render it.
+    color: VALID_COLORS.includes(restoreMeta && restoreMeta.color) ? restoreMeta.color : null,
+    // Manual tile-width (2026-09-26): fraction of row width, set only by
+    // dragging a handle; null = auto/equal share. Lives on the TAB so it
+    // survives reorders, paging, and restarts intact.
+    widthFrac: (restoreMeta && typeof restoreMeta.widthFrac === 'number') ? restoreMeta.widthFrac : null
   };
 
   const wc = view.webContents;
 
   // Cosmetic + behaviour injection once the DOM is ready.
   wc.on('dom-ready', () => {
+    try { wc.setZoomFactor(zoomFactor); } catch (_e) {} // reasserted per-navigation
     wc.insertCSS(VIEW_CSS).catch(() => {});
     // main-world injection so we can hook the page's own fetch()
     wc.executeJavaScript(bootstrapFor(tab)).catch((e) => DBG('inject fail', e.message));
     if (tab.sidebarExpanded) wc.send('ccc:setSidebar', true);
+    // Active-tile border: correct on every dom-ready (initial load, restore,
+    // reload-after-crash) regardless of ordering against activeId elsewhere.
+    try { wc.send('ccc:setActive', tab.id === activeId); } catch (_e) {}
   });
+
+  // Self-heal blank tiles: a failed initial loadURL (transient network at
+  // launch, dropped connection, renderer crash) used to leave a tile
+  // permanently blank because nothing retried. Reload on failure with capped
+  // backoff; reset once a load completes. ERR_ABORTED (-3) is a normal SPA
+  // navigation, not a failure. (2026-09-05)
+  let _reloadTimer = null;
+  let _backoff = 0;
+  const _RETRY_CAP = 15000;
+  const _scheduleReload = (reason) => {
+    if (!tabs.includes(tab) || _reloadTimer) return;
+    _backoff = _backoff ? Math.min(_backoff * 2, _RETRY_CAP) : 1000;
+    DBG('tile reload', tab.id, reason, _backoff + 'ms');
+    _reloadTimer = setTimeout(() => {
+      _reloadTimer = null;
+      if (tabs.includes(tab)) { try { wc.loadURL(tab.url); } catch (_e) {} }
+    }, _backoff);
+  };
+  wc.on('did-finish-load', () => {
+    _backoff = 0;
+    if (_reloadTimer) { clearTimeout(_reloadTimer); _reloadTimer = null; }
+  });
+  wc.on('did-fail-load', (_e, errorCode, errorDesc, _validatedURL, isMainFrame) => {
+    if (!isMainFrame || errorCode === -3) return;   // subframe / ERR_ABORTED = benign
+    DBG('did-fail-load', tab.id, errorCode, errorDesc);
+    _scheduleReload('fail-load:' + errorCode);
+  });
+  wc.on('render-process-gone', (_e, details) => {
+    DBG('render-gone', tab.id, details && details.reason);
+    _backoff = 0;                                   // crash: retry promptly
+    _scheduleReload('render-gone');
+  });
+  wc.on('unresponsive', () => DBG('tile unresponsive', tab.id));
 
   // Keep the tab title in sync with the chat.
   wc.on('page-title-updated', (_e, title) => {
     tab.title = cleanTitle(title);
     persist(); relayout();
   });
+  // A tile moving to another conversation changes the shared open-chat set.
+  const _syncNav = () => { if (cccSync) { try { cccSync.onLocalChange(); } catch (_e) { /* never break a tile */ } } };
+  wc.on('did-navigate', _syncNav);
+  wc.on('did-navigate-in-page', _syncNav);
 
   // Focus/click anywhere in a chat => it becomes active (MRU input).
-  wc.on('focus', () => activate(tab.id, /*fromUser*/ true));
+  wc.on('focus', () => activate(tab.id, {}));   // active-only; never reorders (refresh-safe)
 
   // Reload this tile: Ctrl+R / F5 (Ctrl+Shift+R = hard). Scoped to the focused
   // tile via before-input-event so it never hijacks the shortcut system-wide.
   wc.on('before-input-event', (e, input) => {
     if (input.type !== 'keyDown') return;
+    if (handleAppKeys(e, input)) return;   // Ctrl+T/W/arrows/1-9 etc (app-scoped)
     const k = (input.key || '').toLowerCase();
     const mod = input.control || input.meta;
     if (k === 'f5' || (mod && k === 'r')) {
@@ -207,7 +418,23 @@ function createTab(url, restoreMeta, opts) {
   // Right-click menu (the native one is otherwise swallowed by the view).
   wc.on('context-menu', (_e, params) => {
     const nav = wc.navigationHistory;
-    Menu.buildFromTemplate([
+    const template = [];
+    // Spelling corrections first when right-clicking a misspelled word.
+    if (params.misspelledWord) {
+      for (const s of params.dictionarySuggestions) {
+        template.push({ label: s, click: () => wc.replaceMisspelling(s) });
+      }
+      if (params.dictionarySuggestions.length === 0) {
+        template.push({ label: 'No suggestions', enabled: false });
+      }
+      template.push({ type: 'separator' });
+      template.push({
+        label: 'Add to dictionary',
+        click: () => wc.session.addWordToSpellCheckerDictionary(params.misspelledWord)
+      });
+      template.push({ type: 'separator' });
+    }
+    template.push(
       { label: 'Reload', accelerator: 'CmdOrCtrl+R', click: () => wc.reload() },
       { label: 'Hard Reload', click: () => wc.reloadIgnoringCache() },
       { type: 'separator' },
@@ -217,21 +444,57 @@ function createTab(url, restoreMeta, opts) {
       { label: 'Cut', role: 'cut', enabled: params.editFlags.canCut },
       { label: 'Copy', role: 'copy', enabled: params.editFlags.canCopy },
       { label: 'Paste', role: 'paste', enabled: params.editFlags.canPaste },
-    ]).popup();
+    );
+    // Explicit window: BaseWindow apps have no focused BrowserWindow, so a
+    // bare popup() can silently no-op (electron#44898) — this was "right-click
+    // does nothing". x/y omitted: params are view-relative; default = cursor.
+    Menu.buildFromTemplate(template).popup({ window: win });
   });
 
-  // Links that would spawn a window -> open as a new tab if they're claude.ai.
+  // Links: claude.ai -> new tile; anything else -> the system browser
+  // (xdg default, i.e. Thorium). Previously non-claude links were silently
+  // denied — "links do not open" (fixed 2026-08-06).
+  // openExternal can fail quietly when the app was launched without the full
+  // desktop session env, so fall back to spawning xdg-open directly.
+  const openInBrowser = (target) => {
+    shell.openExternal(target).catch(() => {
+      try {
+        require('child_process').spawn('xdg-open', [target], { detached: true, stdio: 'ignore' }).unref();
+      } catch (_e) { /* nothing else to try */ }
+    });
+  };
   wc.setWindowOpenHandler(({ url: target }) => {
     if (target.startsWith(CFG.ORIGIN)) { createTab(target); }
+    else if (/^https?:/i.test(target)) { openInBrowser(target); }
     return { action: 'deny' };
+  });
+  // Same for links that navigate the tile itself away from claude.ai.
+  wc.on('will-navigate', (e, target) => {
+    if (target.startsWith(CFG.ORIGIN)) return;
+    e.preventDefault();
+    if (/^https?:/i.test(target)) openInBrowser(target);
   });
 
   win.contentView.addChildView(view);
   if (!opts.deferLoad) wc.loadURL(tab.url);   // restore path loads via the staggered queue
 
+  if (opts.background) {
+    // Opened by ccc-sync because another machine has this chat open: append at
+    // the END and leave the active tile and pageOffset alone, so a remote
+    // change never moves what the person is looking at.
+    tabs.push(tab);
+    relayout(); persist();
+    return tab;
+  }
+  const prevActiveId = activeId;
   tabs.unshift(tab);      // new tab enters at front of MRU
   pageOffset = 0;
   activeId = id;
+  // Active-tile border: the new tab picks up its state in the dom-ready
+  // handler above (covers restore/fresh-boot/reload uniformly); the tab
+  // that WAS active is already loaded and won't get another dom-ready just
+  // because a new one appeared, so clear it explicitly here.
+  if (prevActiveId != null && prevActiveId !== id) pushActive(prevActiveId, false);
   relayout(); persist();
   return tab;
 }
@@ -243,39 +506,89 @@ function closeTab(id) {
   try { win.contentView.removeChildView(tab.view); } catch (_e) {}
   // BaseWindow won't destroy webContents for us -> we must, or it leaks.
   try { tab.view.webContents.close(); } catch (_e) {}
-  if (activeId === id) activeId = tabs[0] ? tabs[0].id : null;
+  if (activeId === id) {
+    activeId = tabs[0] ? tabs[0].id : null;
+    if (activeId != null) pushActive(activeId, true); // new tab takes over the border
+  }
   relayout(); persist();
 }
 
-function activate(id, fromUser) {
+function activate(id, opts) {
+  opts = opts || {};
   const idx = tabs.findIndex((t) => t.id === id);
   if (idx === -1) return;
   const tab = tabs[idx];
+  const prevId = activeId;
   tab.lastActive = Date.now();
   activeId = id;
+  // Active-tile border: only touch the two tiles actually changing state.
+  if (prevId !== id) {
+    if (prevId != null) pushActive(prevId, false);
+    pushActive(id, true);
+  }
 
   const [W] = win.getContentSize();
   const columns = computeColumns(W);
   const isVisible = idx >= pageOffset && idx < pageOffset + columns;
+  const mode = CFG.REORDER_MODE || 'manual';
 
-  const mode = CFG.REORDER_MODE;
-  const shouldPull = !restoring && (
-    mode === 'always' ||
-    (mode === 'offscreen-only' && !isVisible)
-  );
-
-  if (shouldPull) {
+  // Default 'manual' NEVER reorders on activation, so a chat auto-refreshing
+  // (claude.ai autofocus -> focus event) can't scramble the order. Legacy MRU
+  // modes are opt-in via config. Rearrange is manual: drag a chip, or
+  // Ctrl+Shift+PageUp/PageDown.
+  if (mode !== 'manual' && mode !== 'off' && !restoring &&
+      (mode === 'always' || (mode === 'offscreen-only' && !isVisible))) {
     tabs.splice(idx, 1);
     tabs.unshift(tab);
     pageOffset = 0;
+  } else if (opts.bringIntoView && !isVisible) {
+    // manual: keep order fixed; just page the chosen chat into view
+    const maxOffset = Math.max(0, tabs.length - columns);
+    if (idx < pageOffset) pageOffset = idx;
+    else pageOffset = Math.min(maxOffset, idx - columns + 1);
   }
-  if (fromUser) tab.view.webContents.focus();
+
+  if (opts.focusView) { try { tab.view.webContents.focus(); } catch (_e) {} }
   relayout(); persist();
+}
+
+// Manual reorder: move a tab to an absolute index. Order is user-owned and
+// persisted, so it survives refreshes and restarts.
+function moveTab(id, toIndex) {
+  const from = tabs.findIndex((t) => t.id === id);
+  if (from === -1) return;
+  toIndex = Math.max(0, Math.min(tabs.length - 1, toIndex | 0));
+  if (toIndex === from) return;
+  const [tab] = tabs.splice(from, 1);
+  tabs.splice(toIndex, 0, tab);
+  const [W] = win.getContentSize();
+  const columns = computeColumns(W);
+  const maxOffset = Math.max(0, tabs.length - columns);
+  if (toIndex < pageOffset) pageOffset = toIndex;
+  else if (toIndex >= pageOffset + columns) pageOffset = Math.min(maxOffset, toIndex - columns + 1);
+  pageOffset = Math.max(0, Math.min(maxOffset, pageOffset));
+  relayout(); persist();
+}
+
+function moveActive(dir) {
+  if (activeId == null) return;
+  const i = tabs.findIndex((t) => t.id === activeId);
+  if (i !== -1) moveTab(activeId, i + dir);
 }
 
 function cleanTitle(t) {
   if (!t) return 'New chat';
   return t.replace(/\s*[-|–]\s*Claude\s*$/i, '').trim().slice(0, 40) || 'New chat';
+}
+
+// Active-tile border (2026-09-26, Frank spec): each tile is its own isolated
+// page with no way to know whether main.js currently considers it active, so
+// this pushes an explicit ccc:setActive down whenever activeId changes.
+// Safe to call with a stale/removed id (e.g. a tab that just closed) — the
+// find() just misses and nothing is sent.
+function pushActive(id, isActive) {
+  const tab = tabs.find((t) => t.id === id);
+  if (tab) { try { tab.view.webContents.send('ccc:setActive', isActive); } catch (_e) {} }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,25 +603,52 @@ function bootstrapFor(tab) {
     resumeJitterMin: CFG.RESUME_JITTER_MIN_SEC,
     resumeJitterMax: CFG.RESUME_JITTER_MAX_SEC,
     resumePoll: CFG.RESUME_POLL_SEC,
-    usageDebug: CFG.USAGE_CAPTURE_DEBUG
+    usageDebug: CFG.USAGE_CAPTURE_DEBUG,
+    color: tab.color || null
   });
-  return `(function(){ window.__CCC_CFG__ = ${cfg}; })();\n${AUTOMATIONS_JS}`;
+  return `(function(){ window.__CCC_CFG__ = ${cfg}; })();\n${AUTOMATIONS_JS}\n${SKIM_CORE_JS}\n${SKIM_INJECT_JS}`;
 }
 
 // ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
-function persist() {
-  store.saveDebounced(() => ({
+function snapshot() {
+  return {
     tabs: tabs.map((t) => ({
       id: t.id,
-      url: t.view.webContents.getURL() || t.url,
+      url: (!t.view.webContents.isDestroyed() && t.view.webContents.getURL()) || t.url,
       title: t.title,
       lastActive: t.lastActive,
-      sidebarExpanded: t.sidebarExpanded
+      sidebarExpanded: t.sidebarExpanded,
+      color: t.color || null,
+      widthFrac: (typeof t.widthFrac === 'number') ? t.widthFrac : null
     })),
-    pageOffset
-  }), CFG.STATE_DEBOUNCE_MS);
+    pageOffset,
+    zoomFactor
+  };
+}
+function persist() {
+  store.saveDebounced(snapshot, CFG.STATE_DEBOUNCE_MS);
+  if (cccSync) { try { cccSync.onLocalChange(); } catch (_e) { /* sync must never break the UI */ } }
+}
+
+// wq#2036 helpers (only used when cccSync is enabled)
+function tabUrl(t) { return (!t.view.webContents.isDestroyed() && t.view.webContents.getURL()) || t.url; }
+function tabByConv(convId) { return tabs.find((t) => cccOps.convIdFromUrl(tabUrl(t)) === convId); }
+function startCccSync() {
+  try {
+    cccSync = cccSyncMod.maybeStart(app.getPath('userData'), {
+      getTabs: () => tabs.map((t) => ({ url: tabUrl(t), title: t.title, lastActive: t.lastActive })),
+      openChat: ({ url, title }) => createTab(url, { title }, { background: true }),
+      closeChat: (convId) => { const t = tabByConv(convId); if (t) closeTab(t.id); },
+      isProtected: (convId) => { const t = tabByConv(convId); return !!t && t.id === activeId; },
+      log: DBG,
+    });
+    if (cccSync) DBG('ccc-sync enabled, log', cccSync.oplogFile);
+  } catch (e) {
+    cccSync = null;
+    console.error('[ccc] ccc-sync failed to start, continuing without it:', e && e.message);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -317,7 +657,8 @@ function persist() {
 function wireIpc() {
   ipcMain.on('ccc:newTab', () => createTab(CFG.START_URL));
   ipcMain.on('ccc:closeTab', (_e, id) => closeTab(id));
-  ipcMain.on('ccc:focusTab', (_e, id) => activate(id, true));
+  ipcMain.on('ccc:focusTab', (_e, id) => activate(id, { bringIntoView: true, focusView: true }));
+  ipcMain.on('ccc:moveTab', (_e, p) => { if (p) moveTab(p.id, p.toIndex); });
   ipcMain.on('ccc:page', (_e, dir) => {
     const [W] = win.getContentSize();
     const columns = computeColumns(W);
@@ -331,6 +672,64 @@ function wireIpc() {
     tab.sidebarExpanded = !tab.sidebarExpanded;
     tab.view.webContents.send('ccc:setSidebar', tab.sidebarExpanded);
     persist();
+  });
+
+  // Per-tile ID color, set from the in-header color pad (replaces the native
+  // Share button — 2026-09-25, Frank spec). Sender is the tile's own
+  // webContents, so we match on that rather than trusting a passed id.
+  ipcMain.on('ccc:setColor', (e, payload) => {
+    const tab = tabs.find((t) => t.view.webContents.id === e.sender.id);
+    if (!tab) return;
+    const c = payload && payload.color;
+    tab.color = VALID_COLORS.includes(c) ? c : null;
+    persist();
+    const [W] = win.getContentSize();
+    const columns = computeColumns(W);
+    pushTabStrip(columns, Math.max(0, tabs.length - columns));
+  });
+
+  // Manual tile-width resize (2026-09-25, redesigned 2026-09-26): horizontal-
+  // only drag of the seam between two tiles. Captures the two TABS at this
+  // gap's position by reference, so the resulting width follows those tabs
+  // through any later reorder/page — not the gap's position on screen.
+  ipcMain.on('ccc:resizeStart', (e, payload) => {
+    const idx = handles.findIndex((h) => h.view.webContents.id === e.sender.id);
+    if (idx === -1) return;
+    const [W, H] = win.getContentSize();
+    const top = CFG.TOPBAR_HEIGHT, bot = CFG.BOTTOMBAR_HEIGHT;
+    const midH = Math.max(0, H - top - bot);
+    const columns = computeColumns(W);
+    const gap = CFG.TILE_GAP || 0;
+    const avail = Math.max(0, W - gap * (columns - 1));
+    const visible = tabs.slice(pageOffset, pageOffset + columns);
+    const widths = widthsForVisible(visible, avail);
+    const tabA = visible[idx], tabB = visible[idx + 1];
+    if (!tabA || !tabB) return;
+    resizeDrag = {
+      handleIndex: idx, tabA, tabB,
+      startScreenX: (payload && payload.screenX) || 0,
+      wA: widths[idx], wB: widths[idx + 1],
+      columns, gap, avail
+    };
+    // Expand to the full row so pointer events keep landing on it as the
+    // cursor travels past its own thin resting strip (Electron routes input
+    // to whatever view is under the cursor, not to whoever has "focus").
+    handles[idx].view.setBounds({ x: 0, y: top, width: W, height: midH });
+  });
+  ipcMain.on('ccc:resizeMove', (e, payload) => {
+    if (!resizeDrag) return;
+    const idx = handles.findIndex((h) => h.view.webContents.id === e.sender.id);
+    if (idx !== resizeDrag.handleIndex) return;
+    applyDrag((payload && payload.screenX) || 0);
+  });
+  ipcMain.on('ccc:resizeEnd', (e, payload) => {
+    if (!resizeDrag) return;
+    const idx = handles.findIndex((h) => h.view.webContents.id === e.sender.id);
+    if (idx !== resizeDrag.handleIndex) return;
+    applyDrag((payload && payload.screenX) || 0);
+    resizeDrag = null;
+    persist();
+    relayout(); // snaps the now-free handle back to its resting strip
   });
 
   // usage from a claude view -> forward to the bottom bar (active tab only)
@@ -388,6 +787,151 @@ function wireIpc() {
 }
 
 // ---------------------------------------------------------------------------
+// DeepSeek spend telemetry — poll Lumen's messenger /spend (tailnet-direct,
+// telemetry-allowlisted 2026-07-11) from the MAIN process (net = no CORS) and
+// push to the bottom bar. Server refreshes its history via a 15-min systemd
+// timer; we poll on a 5-min cadence so the bar is never >20 min stale.
+// ---------------------------------------------------------------------------
+let dsTimer = null;
+
+function fetchSpendJSON(url) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      const { net } = require('electron');
+      const req = net.request({ url });
+      let body = '';
+      req.on('response', (res) => {
+        res.on('data', (c) => { body += c; });
+        res.on('end', () => {
+          try { finish(res.statusCode < 400 ? JSON.parse(body) : null); }
+          catch (_e) { finish(null); }
+        });
+      });
+      req.on('error', () => finish(null));
+      setTimeout(() => finish(null), 8000);
+      req.end();
+    } catch (_e) { finish(null); }
+  });
+}
+
+async function pollDeepseek() {
+  if (!CFG.SPEND_URL) return;
+  const s = await fetchSpendJSON(CFG.SPEND_URL);
+  if (!s || s.error) {
+    if (bottombar) bottombar.webContents.send('deepseek', { ok: false });
+    return;
+  }
+  const h = s.history || {};
+  const fmt = (v) => (v == null ? '—' : '$' + Number(v).toFixed(2));
+  let last = null;
+  if (h.most_recent && h.most_recent.amount != null) {
+    const ago = Math.max(0, Math.round((Date.now() / 1000 - h.most_recent.ts) / 60));
+    last = '$' + Number(h.most_recent.amount).toFixed(4) + ' · ' + ago + 'm ago';
+  }
+  const bal = (h.balance != null ? h.balance : s.balance);
+  if (bottombar) bottombar.webContents.send('deepseek', {
+    ok: true,
+    balance: bal != null ? '$' + Number(bal).toFixed(2) : '—',
+    today: fmt(h.today != null ? h.today : s.spent_today),
+    hour: fmt(h.last_hour),
+    month: fmt(h.this_month),
+    year: fmt(h.this_year),
+    last
+  });
+}
+
+function startDeepseekTelemetry() {
+  pollDeepseek();
+  dsTimer = setInterval(pollDeepseek, CFG.SPEND_POLL_MS || 300000);
+}
+
+// System telemetry (Thor host) — CPU%, package temp, mem, disk. Sampled in the
+// MAIN process (runs on the box) and pushed to the bottom bar, mirroring the
+// DeepSeek poller. Thor's fan is suspected-dead (light-duty only), so package
+// temp is the headline number: it flags thermal-throttle risk live. Pure Node,
+// no deps. (2026-07-13)
+// ---------------------------------------------------------------------------
+let ssTimer = null;
+let ssPrevCpu = null;   // { total, idle } from previous /proc/stat sample
+
+function ssCpuPct() {
+  try {
+    const line = fs.readFileSync('/proc/stat', 'utf8').split('\n', 1)[0];
+    const p = line.trim().split(/\s+/).slice(1).map(Number);
+    const idle = (p[3] || 0) + (p[4] || 0);
+    const total = p.reduce((a, b) => a + (b || 0), 0);
+    let pct = null;
+    if (ssPrevCpu) {
+      const dt = total - ssPrevCpu.total, di = idle - ssPrevCpu.idle;
+      if (dt > 0) pct = Math.round((1 - di / dt) * 100);
+    }
+    ssPrevCpu = { total, idle };
+    return pct;
+  } catch (_e) { return null; }
+}
+
+function ssMemPct() {
+  try {
+    const mi = fs.readFileSync('/proc/meminfo', 'utf8');
+    const get = (k) => { const m = mi.match(new RegExp('^' + k + ':\\s+(\\d+)', 'm')); return m ? Number(m[1]) : null; };
+    const total = get('MemTotal'), avail = get('MemAvailable');
+    if (!total || avail == null) return null;
+    return Math.round((1 - avail / total) * 100);
+  } catch (_e) { return null; }
+}
+
+function ssDiskPct() {
+  try {
+    const s = fs.statfsSync('/');
+    const used = s.blocks - s.bfree, denom = (s.blocks - s.bfree) + s.bavail;
+    if (denom <= 0) return null;
+    return Math.round((used / denom) * 100);
+  } catch (_e) { return null; }
+}
+
+function ssCpuTemp() {
+  // Prefer Intel package thermal zone; fall back to coretemp/k10temp/acpitz hwmon.
+  try {
+    for (const z of fs.readdirSync('/sys/class/thermal')) {
+      if (!z.startsWith('thermal_zone')) continue;
+      try {
+        if (fs.readFileSync('/sys/class/thermal/' + z + '/type', 'utf8').trim() === 'x86_pkg_temp') {
+          const t = Number(fs.readFileSync('/sys/class/thermal/' + z + '/temp', 'utf8').trim());
+          if (t > 0) return Math.round(t / 1000);
+        }
+      } catch (_e) { /* skip zone */ }
+    }
+  } catch (_e) { /* fall through */ }
+  try {
+    for (const h of fs.readdirSync('/sys/class/hwmon')) {
+      try {
+        const name = fs.readFileSync('/sys/class/hwmon/' + h + '/name', 'utf8').trim();
+        if (name === 'coretemp' || name === 'k10temp' || name === 'acpitz') {
+          const t = Number(fs.readFileSync('/sys/class/hwmon/' + h + '/temp1_input', 'utf8').trim());
+          if (t > 0) return Math.round(t / 1000);
+        }
+      } catch (_e) { /* skip */ }
+    }
+  } catch (_e) { /* give up */ }
+  return null;
+}
+
+function pollSysStats() {
+  if (!bottombar) return;
+  bottombar.webContents.send('sysstats', {
+    cpu: ssCpuPct(), temp: ssCpuTemp(), mem: ssMemPct(), disk: ssDiskPct()
+  });
+}
+
+function startSysStatsTelemetry() {
+  ssCpuPct();                       // prime CPU delta baseline
+  setTimeout(pollSysStats, 1000);   // first real sample after baseline
+  ssTimer = setInterval(pollSysStats, CFG.SYSSTATS_POLL_MS || 3000);
+}
+
+// ---------------------------------------------------------------------------
 // Chrome views (our own top/bottom bars)
 // ---------------------------------------------------------------------------
 function makeChromeView(file) {
@@ -398,7 +942,7 @@ function makeChromeView(file) {
       nodeIntegration: false
     }
   });
-  v.setBackgroundColor('#111111');
+  v.setBackgroundColor('#090a0f'); // 2026-09-26: matches the dark-theme canvas bg (design brief)
   v.webContents.loadFile(path.join(__dirname, 'renderer', file));
   return v;
 }
@@ -410,11 +954,17 @@ function boot() {
   nativeTheme.themeSource = 'dark';
   claudeSession = session.fromPartition('persist:claude');
   hardenSession(claudeSession);
+  // Warm DNS/TLS to claude.ai before the first tile loads, so the initial
+  // handshake isn't on the critical path of the cold boot. (2026-07-13)
+  try { claudeSession.preconnect({ url: CFG.ORIGIN, numSockets: 4 }); } catch (_e) {}
+  try { claudeSession.setSpellCheckerLanguages(['en-US']); } catch (_e) {}
 
   win = new BaseWindow({
     width: 1600, height: 900,
-    backgroundColor: '#111111',
-    title: 'Claude Command Center'
+    backgroundColor: '#090a0f', // 2026-09-26: matches the dark-theme canvas bg (design brief); shows in the TILE_GAP between tiles
+    // Per-tile "Claude is AI..." strips are hidden by inject CSS; the notice
+    // lives here in the window title instead (2026-08-06).
+    title: 'Claude Command Center — Claude is AI and can make mistakes. Please double-check responses.'
   });
   Menu.setApplicationMenu(null);
 
@@ -427,6 +977,12 @@ function boot() {
 
   // restore or open one fresh tab
   const saved = store.load();
+  // Zoom, set BEFORE any createTab() call below so restored tiles pick it up
+  // immediately instead of flashing default, then snapping. Per-tab width
+  // (widthFrac) is restored per-tab inside createTab() itself now (2026-09-26
+  // redesign) — it lives on each tab, not a separate global array, so it
+  // survives reorders and paging without drifting to the wrong chat.
+  zoomFactor = (saved && typeof saved.zoomFactor === 'number') ? saved.zoomFactor : CFG.ZOOM_DEFAULT;
   if (saved && saved.tabs.length) {
     restoring = true;   // hold MRU reordering until tiles settle, else load-time
                         // focus events scramble the restored order on reopen
@@ -440,28 +996,67 @@ function boot() {
     createTab(CFG.START_URL);
   }
 
+  startCccSync();
+  win.on('focus', () => { if (cccSync) { try { cccSync.reconcile(false); } catch (_e) { /* next poll */ } } });
+
   win.on('resize', relayout);
   win.on('maximize', relayoutDeferred);
   win.on('unmaximize', relayoutDeferred);
   win.on('enter-full-screen', relayoutDeferred);
   win.on('leave-full-screen', relayoutDeferred);
-  win.on('close', () => { persist(); });
+  // Flush synchronously on close/quit: the debounced persist() never fires
+  // here because app.quit() kills the process before the timer (zombie-tab
+  // bug, fixed 2026-08-06). before-quit also covers SIGTERM.
+  win.on('close', () => { store.saveNow(snapshot); });
   relayout();
 
   registerShortcuts();
+  startDeepseekTelemetry();
+  startSysStatsTelemetry();
 }
 
-function registerShortcuts() {
-  globalShortcut.register('CommandOrControl+T', () => createTab(CFG.START_URL));
-  globalShortcut.register('CommandOrControl+W', () => { if (activeId) closeTab(activeId); });
-  globalShortcut.register('CommandOrControl+Right', () => sendPage(+1));
-  globalShortcut.register('CommandOrControl+Left', () => sendPage(-1));
-  for (let n = 1; n <= 9; n++) {
-    globalShortcut.register(`CommandOrControl+${n}`, () => {
-      const tab = tabs[n - 1];
-      if (tab) activate(tab.id, true);
-    });
+// App shortcuts, scoped to CCC's own webContents via before-input-event.
+// Previously these were globalShortcut registrations, which intercept keys
+// SYSTEM-WIDE while CCC runs — Ctrl+W in the browser closed a CCC tile
+// instead of the browser tab (fixed 2026-08-06). registerShortcuts() now
+// only attaches to the chrome bars; tiles attach in createTab.
+function handleAppKeys(e, input) {
+  if (input.type !== 'keyDown') return false;
+  const mod = input.control || input.meta;
+  if (!mod || input.alt) return false;
+  const k = (input.key || '').toLowerCase();
+
+  // Global chat-tile zoom (2026-09-25): Ctrl+=/Ctrl+-/Ctrl+0, every tile at
+  // once, never the CCC chrome. Checked before the shift branch below since
+  // producing '+' needs Shift on most keyboards but the shortcut shouldn't
+  // care either way (numpad +/- report the same input.key regardless).
+  if (k === '=' || k === '+') { e.preventDefault(); setZoom(zoomFactor + CFG.ZOOM_STEP); return true; }
+  if (k === '-' || k === '_') { e.preventDefault(); setZoom(zoomFactor - CFG.ZOOM_STEP); return true; }
+  if (k === '0') { e.preventDefault(); setZoom(CFG.ZOOM_DEFAULT); return true; }
+
+  if (!input.shift) {
+    if (k === 't') { e.preventDefault(); createTab(CFG.START_URL); return true; }
+    if (k === 'w') { e.preventDefault(); if (activeId) closeTab(activeId); return true; }
+    if (k === 'arrowright') { e.preventDefault(); sendPage(+1); return true; }
+    if (k === 'arrowleft') { e.preventDefault(); sendPage(-1); return true; }
+    if (k >= '1' && k <= '9') {
+      const tab = tabs[Number(k) - 1];
+      if (tab) { e.preventDefault(); activate(tab.id, { bringIntoView: true, focusView: true }); }
+      return true;
+    }
+  } else {
+    // move the active chat left / right in the manual order
+    if (k === 'pageup') { e.preventDefault(); moveActive(-1); return true; }
+    if (k === 'pagedown') { e.preventDefault(); moveActive(+1); return true; }
   }
+  return false;
+}
+function attachAppKeys(wc) {
+  wc.on('before-input-event', (e, input) => { handleAppKeys(e, input); });
+}
+function registerShortcuts() {
+  attachAppKeys(topbar.webContents);
+  attachAppKeys(bottombar.webContents);
 }
 function sendPage(dir) {
   const [W] = win.getContentSize();
@@ -471,6 +1066,17 @@ function sendPage(dir) {
   relayout();
 }
 
+// Global chat-tile zoom (2026-09-25): applies to every tile's webContents at
+// once — never the topbar/bottombar chrome, never one tile independently.
+// Rounded to 2dp so repeated +/- 0.1 steps don't accumulate float grime.
+function setZoom(factor) {
+  factor = Math.max(CFG.ZOOM_MIN, Math.min(CFG.ZOOM_MAX, factor));
+  zoomFactor = Math.round(factor * 100) / 100;
+  tabs.forEach((t) => { try { t.view.webContents.setZoomFactor(zoomFactor); } catch (_e) {} });
+  persist();
+}
+
 app.whenReady().then(boot);
-app.on('will-quit', () => globalShortcut.unregisterAll());
+app.on('before-quit', () => { store.saveNow(snapshot); });  // covers SIGTERM / non-window quit paths
+app.on('will-quit', () => { globalShortcut.unregisterAll(); if (dsTimer) clearInterval(dsTimer); });
 app.on('window-all-closed', () => app.quit());

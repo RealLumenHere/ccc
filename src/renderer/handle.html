@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<!--
+  CCC tile resize handle (2026-09-25). One of these per gap between tiles.
+  Rests at TILE_GAP width; main.js temporarily EXPANDS this view's own
+  bounds to the full tile-row width for the duration of a drag so pointer
+  events keep landing on it even once the cursor leaves the resting strip
+  (Electron routes input to whichever WebContentsView is under the cursor,
+  so a narrow view alone loses the drag the instant the mouse moves past
+  its edges). Horizontal-only by design: this bar only ever reports an x
+  position, there is no vertical drag anywhere in CCC.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; background:transparent;
+    overflow:hidden; cursor:col-resize; user-select:none; }
+  #bar { position:absolute; top:0; bottom:0; width:100%; height:100%; }
+  /* Resting strip: a thin centered line, brightens on hover so it reads as
+     grabbable instead of repeating the old "invisible 1px border" mistake.
+     2026-09-26: was a WHITE rgba overlay, then flipped to dark when tiles
+     went pastel-medium-toned. Now back to light (Frank's design brief
+     reverts the whole theme to dark) — a dark line would vanish again
+     against the new #111318 pane bg. Drag-active color matches the
+     brief's violet accent instead of the old cyan, for consistency with
+     the active-tile indicator and gradient top bar. */
+  #line { position:absolute; top:0; bottom:0; left:50%; width:2px; margin-left:-1px;
+    background:rgba(255,255,255,0.14); transition:background 80ms ease, width 80ms ease; }
+  body.dragging #line { transition:none; margin-left:-1.5px; } /* JS drives left px while dragging */
+  #bar:hover #line { background:rgba(255,255,255,0.55); width:3px; margin-left:-1.5px; }
+  body.dragging #line { background:#a855f7; width:3px; }
+</style>
+</head>
+<body>
+<div id="bar"><div id="line"></div></div>
+<script>
+  var bar = document.getElementById('bar');
+  var line = document.getElementById('line');
+  var dragging = false;
+
+  function send(ch, data) { window.ccc.send(ch, data); }
+
+  bar.addEventListener('pointerdown', function (ev) {
+    if (ev.button !== 0) return;
+    dragging = true;
+    document.body.classList.add('dragging');
+    line.style.left = ev.clientX + 'px'; // main.js is about to expand this
+    line.style.marginLeft = '0';          // view to full-row width; keep the
+                                           // line under the actual cursor
+    try { bar.setPointerCapture(ev.pointerId); } catch (e) {}
+    send('ccc:resizeStart', { screenX: ev.screenX });
+    ev.preventDefault();
+  });
+  bar.addEventListener('pointermove', function (ev) {
+    if (!dragging) return;
+    line.style.left = ev.clientX + 'px'; // cursor's actual position, not 50%
+    send('ccc:resizeMove', { screenX: ev.screenX });
+  });
+  function end(ev) {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove('dragging');
+    line.style.left = '';        // back to resting CSS (50%, -1px margin)
+    line.style.marginLeft = '';
+    send('ccc:resizeEnd', { screenX: ev.screenX });
+  }
+  bar.addEventListener('pointerup', end);
+  bar.addEventListener('pointercancel', end);
+  // Safety net: if focus/visibility is lost mid-drag (alt-tab, view swap),
+  // don't leave main.js waiting forever for a resizeEnd that never comes.
+  window.addEventListener('blur', function () { if (dragging) end({ screenX: 0 }); });
+</script>
+</body>
+</html>

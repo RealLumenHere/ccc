@@ -16,6 +16,7 @@ window.addEventListener('message', (ev) => {
     case 'completed':        ipcRenderer.send('ccc:completed', m.data); break;
     case 'limit':            ipcRenderer.send('ccc:limit', m.data); break;
     case 'resumed':          ipcRenderer.send('ccc:resumed', m.data); break;
+    case 'setColor':         ipcRenderer.send('ccc:setColor', m.data); break;
     default: break;
   }
 });
@@ -23,5 +24,14 @@ window.addEventListener('message', (ev) => {
 ipcRenderer.on('ccc:setSidebar', (_e, expanded) => {
   try {
     document.body.classList.toggle('ccc-sidebar-collapsed', !expanded);
+  } catch (_err) {}
+});
+
+// Active-tile border (2026-09-26, Frank spec): main.js pushes this whenever
+// activeId changes (activate/createTab/closeTab) and once per dom-ready so
+// a restored/reloaded tile picks up its correct state immediately.
+ipcRenderer.on('ccc:setActive', (_e, isActive) => {
+  try {
+    document.body.classList.toggle('ccc-active', !!isActive);
   } catch (_err) {}
 });
